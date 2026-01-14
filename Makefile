@@ -7,7 +7,7 @@ OBJDIR = obj
 BINDIR = bin
 LIBDIR = lib
 
-# Targets
+# Targets 
 TARGETS = $(BINDIR)/ginit $(BINDIR)/getty $(BINDIR)/login
 LIBRARY = $(LIBDIR)/libgemcore.a
 
