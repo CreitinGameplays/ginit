@@ -1,0 +1,28 @@
+service "dbus" {
+    meta {
+        description = "D-Bus System Message Bus"
+        deps {
+            after = ["udevd"]
+        }
+    }
+
+    process {
+        type = "dbus"
+        user = "root"
+        group = "root"
+
+        commands {
+            start_pre = "mkdir -p /run/dbus && /usr/bin/dbus-uuidgen --ensure"
+            start     = "/usr/bin/dbus-daemon --system --nofork --nopidfile"
+        }
+
+        lifecycle {
+            restart_policy = "always"
+            restart_delay  = "2s"
+        }
+    }
+
+    install {
+        wanted_by = ["multi-user.target"]
+    }
+}
