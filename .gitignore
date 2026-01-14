@@ -1,1 +1,4 @@
 SUBMODULE_GUIDE.md
+bin
+lib
+obj
