@@ -16,6 +16,7 @@ struct ServiceState {
     int restart_count = 0;
     bool enabled = false;
     bool running = false;
+    bool finished_successfully = false;
 };
 
 class GServiceManager {
@@ -57,6 +58,10 @@ private:
     void setup_security(const GService& config);
     
     void handle_ipc_client(int client_fd);
+
+    // Dependency management
+    std::vector<std::string> get_service_order();
+    void visit(const std::string& name, std::map<std::string, bool>& visited, std::map<std::string, bool>& stack, std::vector<std::string>& order);
 };
 
 } // namespace ginit

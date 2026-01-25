@@ -28,7 +28,7 @@ struct HttpOptions {
 bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& opts);
 
 // Configure Network Interface (eth0)
-void ConfigureNetwork();
+int ConfigureNetwork();
 
 // Resolve Hostname to IP
 std::string ResolveDNS(const std::string& host);

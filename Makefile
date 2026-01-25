@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS += -Wall -Wextra -O2 -I./src
-LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread
+LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt
 
 SRCDIR = src
 OBJDIR = obj

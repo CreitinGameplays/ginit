@@ -27,7 +27,6 @@
 #include "gservice_manager.hpp"
 
 ginit::GServiceManager service_manager;
-#include "gservice_manager.hpp"
 
 // Mount filesystems and ensure target directory exists
 void mount_fs(const char* source, const char* target, const char* fs_type) {
@@ -151,9 +150,28 @@ void show_help() {
     std::cout << "  help               Show this help message" << std::endl;
 }
 
+void handle_signal(int sig) {
+    if (sig == SIGINT) {
+        std::cerr << "[GINIT] Rebooting..." << std::endl;
+        sync();
+        reboot(RB_AUTOBOOT);
+    } else if (sig == SIGTERM || sig == SIGPWR) {
+        std::cerr << "[GINIT] Powering off..." << std::endl;
+        sync();
+        reboot(RB_POWER_OFF);
+    }
+}
+
 int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    if (getpid() == 1) {
+        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/bin/apps/system:/bin/apps", 1);
+        signal(SIGINT, handle_signal);
+        signal(SIGTERM, handle_signal);
+        signal(SIGPWR, handle_signal);
+    }
 
     if (getpid() != 1) {
         if (argc < 2) {
@@ -183,116 +201,116 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
+        if (cmd == "--configure-network") {
+            return ConfigureNetwork();
+        }
+
         std::cerr << "Unknown command: " << cmd << std::endl;
         show_help();
         return 1;
     }
 
-    // Setup basic environment
-    setenv("PATH", "/bin/apps/system:/bin/apps:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin", 1);
-    
     std::cout << "\033[2J\033[1;1H"; 
     std::cout << "Welcome to " << OS_NAME << " " << OS_VERSION << std::endl;     
     
-    ConfigureNetwork();
-    
-    mount_fs("none", "/proc", "proc");
-    mount_fs("none", "/sys", "sysfs");
-    mount_fs("devtmpfs", "/dev", "devtmpfs");
-    mount_fs("devpts", "/dev/pts", "devpts");
-    mount_fs("tmpfs", "/dev/shm", "tmpfs");
-    mount_fs("tmpfs", "/tmp", "tmpfs");
-    mount_fs("tmpfs", "/run", "tmpfs");
-    mount_fs("tmpfs", "/var/log", "tmpfs");
-    mount_fs("tmpfs", "/var/tmp", "tmpfs");
-    mount_fs("tmpfs", "/usr/share/X11/xkb/compiled", "tmpfs");
+mount_fs("none", "/proc", "proc");
+mount_fs("none", "/sys", "sysfs");
+mount_fs("devtmpfs", "/dev", "devtmpfs");
+mount_fs("devpts", "/dev/pts", "devpts");
+mount_fs("tmpfs", "/dev/shm", "tmpfs");
+mount_fs("tmpfs", "/tmp", "tmpfs");
+mount_fs("tmpfs", "/run", "tmpfs");
+mount_fs("tmpfs", "/var/log", "tmpfs");
+mount_fs("tmpfs", "/var/tmp", "tmpfs");
+mount_fs("tmpfs", "/usr/share/X11/xkb/compiled", "tmpfs");
 
-    ensure_fhs();
+ensure_fhs();
 
-    mkdir("/var/lib/dbus", 0755);
-    mkdir("/run/dbus", 0755);
+mkdir("/var/lib/dbus", 0755);
+mkdir("/run/dbus", 0755);
 
-    symlink("/proc/self/fd", "/dev/fd");
-    symlink("/proc/self/fd/0", "/dev/stdin");
-    symlink("/proc/self/fd/1", "/dev/stdout");
-    symlink("/proc/self/fd/2", "/dev/stderr");
+symlink("/proc/self/fd", "/dev/fd");
+symlink("/proc/self/fd/0", "/dev/stdin");
+symlink("/proc/self/fd/1", "/dev/stdout");
+symlink("/proc/self/fd/2", "/dev/stderr");
 
-    UserMgmt::initialize_defaults();
-    generate_os_release();
+UserMgmt::initialize_defaults();
+generate_os_release();
 
-    if (fork() == 0) {
-        execl("/usr/sbin/udevd", "udevd", "--daemon", nullptr);
-        exit(0);
+// Ensure service directories exist
+safe_mkdir("/etc/ginit");
+safe_mkdir("/etc/ginit/services");
+safe_mkdir("/etc/ginit/services/system");
+safe_mkdir("/usr/lib/ginit");
+safe_mkdir("/usr/lib/ginit/services");
+
+// Copy default services to system directory if not present
+// This is a bit of a hack for first boot, but okay for now.
+// In a real OS, this would be handled by the package manager.
+
+std::cerr << "[GINIT] Loading system services..." << std::endl;
+service_manager.load_services_from_dir("/usr/lib/ginit/services");
+service_manager.load_services_from_dir("/etc/ginit/services/system");
+
+// Explicitly enable core services for boot
+service_manager.enable_service("udevd");
+service_manager.enable_service("udev-trigger");
+service_manager.enable_service("udev-settle");
+service_manager.enable_service("network");
+service_manager.enable_service("dbus");
+
+std::cerr << "[GINIT] Starting system services..." << std::endl;
+service_manager.start_enabled_services();
+service_manager.run_ipc_server();
+
+std::vector<std::string> terminals = {"/dev/tty1", "/dev/tty2", "/dev/tty3", "/dev/ttyS0"};
+
+// Check if we are in Live Environment
+bool is_live = (access("/etc/geminios-live", F_OK) == 0);
+
+for (const auto& tty : terminals) {
+    pid_t pid;
+    if (is_live) {
+         // Autologin as root on all terminals for Live CD
+         pid = spawn_getty(tty, "root");
+    } else {
+         // Standard Login Prompt for Installed System
+         pid = spawn_getty(tty);
     }
-    
-    // Give udevd a moment to initialize its socket
-    usleep(500000); 
 
-    if (fork() == 0) {
-        execl("/usr/bin/udevadm", "udevadm", "trigger", "--action=add", nullptr);
-        exit(0);
+    if (pid > 0) {
+        g_tty_pids[pid] = tty;
     }
-    wait(NULL);
+}
 
-    if (fork() == 0) {
-        execl("/usr/bin/udevadm", "udevadm", "settle", nullptr);
-        exit(0);
-    }
-    wait(NULL);
-    
-    std::cerr << "[GINIT] Starting system services..." << std::endl;
-    service_manager.load_services_from_dir("/etc/ginit/services/system");
-    service_manager.start_enabled_services();
-    service_manager.run_ipc_server();
+// Supervisor Loop: Reap and respawn processes
+while (true) {
+    int status;
+    pid_t pid = wait(&status);
 
-    std::vector<std::string> terminals = {"/dev/tty1", "/dev/tty2", "/dev/tty3", "/dev/ttyS0"};
-    
-    // Check if we are in Live Environment
-    bool is_live = (access("/etc/geminios-live", F_OK) == 0);
-
-    for (const auto& tty : terminals) {
-        pid_t pid;
-        if (is_live) {
-             // Autologin as root on all terminals for Live CD
-             pid = spawn_getty(tty, "root");
+    if (pid > 0) {
+        if (service_manager.is_managed_process(pid)) {
+            service_manager.handle_process_death(pid, status);
         } else {
-             // Standard Login Prompt for Installed System
-             pid = spawn_getty(tty);
-        }
+            auto it = g_tty_pids.find(pid);
+            if (it != g_tty_pids.end()) {
+                std::string tty = it->second;
+                g_tty_pids.erase(it);
+                
+                // std::cerr << "[GINIT] TTY " << tty << " respawning..." << std::endl;
+                
+                pid_t new_pid;
+                if (is_live) {
+                    new_pid = spawn_getty(tty, "root");
+                } else {
+                    new_pid = spawn_getty(tty);
+                }
 
-        if (pid > 0) {
-            g_tty_pids[pid] = tty;
-        }
-    }
-
-    // Supervisor Loop: Reap and respawn processes
-    while (true) {
-        int status;
-        pid_t pid = wait(&status);
-
-        if (pid > 0) {
-            if (service_manager.is_managed_process(pid)) {
-                service_manager.handle_process_death(pid, status);
-            } else {
-                auto it = g_tty_pids.find(pid);
-                if (it != g_tty_pids.end()) {
-                    std::string tty = it->second;
-                    g_tty_pids.erase(it);
-                    
-                    // std::cerr << "[GINIT] TTY " << tty << " respawning..." << std::endl;
-                    
-                    pid_t new_pid;
-                    if (is_live) {
-                        new_pid = spawn_getty(tty, "root");
-                    } else {
-                        new_pid = spawn_getty(tty);
-                    }
-
-                    if (new_pid > 0) {
-                        g_tty_pids[new_pid] = tty;
-                    }
+                if (new_pid > 0) {
+                    g_tty_pids[new_pid] = tty;
                 }
             }
         }
     }
+}
 }

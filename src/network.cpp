@@ -34,9 +34,41 @@
 #define NETMASK "255.255.255.0"
 #define DNS_SERVER "10.0.2.3" // QEMU User Network DNS
 
-void ConfigureNetwork() {
+#include <ifaddrs.h>
+
+std::string GetFirstInterface() {
+    struct ifaddrs *ifaddr, *ifa;
+    std::string name = "eth0"; // Default fallback
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return name;
+    }
+
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) continue;
+        
+        std::string ifa_name = ifa->ifa_name;
+        // Skip loopback and non-IP interfaces (we just want names)
+        if (ifa_name != "lo") {
+            name = ifa_name;
+            break; 
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return name;
+}
+
+int ConfigureNetwork() {
+    std::string iface = GetFirstInterface();
+    std::cout << "[NET] Using interface: " << iface << std::endl;
+
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return;
+    if (sock < 0) {
+        perror("[NET] socket");
+        return 1;
+    }
 
     // 0. Setup Loopback (lo)
     struct ifreq ifr_lo;
@@ -52,26 +84,26 @@ void ConfigureNetwork() {
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
+    strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ);
 
     // 1. Set IP Address
     struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
     addr->sin_family = AF_INET;
     inet_pton(AF_INET, MY_IP, &addr->sin_addr);
     if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
-        perror("[NET] Failed to set IP");
-        close(sock); return;
+        perror(("[NET] Failed to set IP on " + iface).c_str());
+        close(sock); return 1;
     }
 
     // 2. Bring Interface UP
     if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-        perror("[NET] Failed to get flags");
-        close(sock); return;
+        perror(("[NET] Failed to get flags for " + iface).c_str());
+        close(sock); return 1;
     }
     ifr.ifr_flags |= (IFF_UP | IFF_RUNNING);
     if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-        perror("[NET] Failed to bring up eth0");
-        close(sock); return;
+        perror(("[NET] Failed to bring up " + iface).c_str());
+        close(sock); return 1;
     }
 
     // 3. Set Default Gateway (Legacy IOCTL method)
@@ -91,10 +123,12 @@ void ConfigureNetwork() {
     inet_pton(AF_INET, GATEWAY, &gw->sin_addr);
 
     route.rt_flags = RTF_UP | RTF_GATEWAY;
-    route.rt_dev = (char*)"eth0"; // Explicitly bind to eth0
+    route.rt_dev = (char*)iface.c_str(); // Use detected interface
 
     if (ioctl(sock, SIOCADDRT, &route) < 0) {
-        if (errno != EEXIST) LOG_DEBUG("Failed to set gateway: " << strerror(errno));
+        if (errno != EEXIST) {
+            // LOG_DEBUG("Failed to set gateway: " << strerror(errno));
+        }
     }
 
     close(sock);
@@ -121,6 +155,7 @@ void ConfigureNetwork() {
     }
 
     std::cout << "[NET] Network Configured: " << MY_IP << " (DNS: " << DNS_SERVER << ")" << std::endl;
+    return 0;
 }
 
 // Minimal DNS Resolver (UDP to 8.8.8.8)

@@ -1,0 +1,17 @@
+service "udev-trigger" {
+    meta {
+        description = "Coldplug All Devices"
+        deps {
+            after = ["udevd"]
+            requires = ["udevd"]
+        }
+    }
+
+    process {
+        type = "oneshot"
+        commands {
+            start_pre = "sleep 1"
+            start = "/usr/bin/udevadm trigger --action=add"
+        }
+    }
+}

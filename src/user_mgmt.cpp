@@ -6,9 +6,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <openssl/sha.h>
+#include <crypt.h>
 #include <iomanip>
 #include <ctime>
 #include <algorithm>
+#include <random>
 
 // Helper string split
 std::vector<std::string> split(const std::string& s, char delimiter) {
@@ -81,7 +83,7 @@ bool UserMgmt::save_shadow(const std::vector<User>& users) {
     long now = std::time(0) / 86400;
     for (const auto& u : users) {
         std::string pwd = u.password.empty() ? "!" : u.password;
-        file << u.username << ":" << pwd << ":" << now << ":0:99999:7:::\n";
+        file << u.username << ":" << pwd << ":" << now << ":0:99999:7:::" << "\n";
     }
     return true;
 }
@@ -124,16 +126,35 @@ bool UserMgmt::save_groups(const std::vector<Group>& groups) {
 }
 
 std::string UserMgmt::hash_password(const std::string& plaintext) {
-    // Simple salted SHA256
-    // Using a static salt for simplicity in this version, 
-    // realistically you want random salt per user.
+    // Generate a random salt for SHA512
+    static const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./";
+    std::string salt = "$6$";
+    
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 63);
+    
+    for(int i = 0; i < 12; i++) {
+        salt += charset[dis(gen)];
+    }
+    salt += "$";
+    
+    char* hashed = crypt(plaintext.c_str(), salt.c_str());
+    if (hashed) return std::string(hashed);
+    
+    // Fallback if crypt fails (should not happen with libxcrypt)
+    return "!";
+}
+
+// Keep old hash logic for verification of old passwords
+std::string hash_password_old(const std::string& plaintext) {
     std::string salt = "GEMINI_SALT"; 
     std::string combined = salt + plaintext;
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256((unsigned char*)combined.c_str(), combined.length(), hash);
     
     std::stringstream ss;
-    ss << "$5$" << salt << "$"; // Fake glibc-like ID for clarity
+    ss << "$5$" << salt << "$";
     for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
         ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
     }
@@ -141,15 +162,24 @@ std::string UserMgmt::hash_password(const std::string& plaintext) {
 }
 
 bool UserMgmt::check_password(const std::string& plaintext, const std::string& hash) {
-    if (hash.empty()) return plaintext.empty(); // Allow empty password
+    if (hash.empty()) return plaintext.empty();
     if (hash == "!" || hash == "*") return false;
-    return hash_password(plaintext) == hash;
+
+    // Check if it's the old custom hash
+    if (hash.length() > 15 && hash.substr(0, 15) == "$5$GEMINI_SALT$") {
+        return hash_password_old(plaintext) == hash;
+    }
+
+    // Standard crypt verification
+    char* encrypted = crypt(plaintext.c_str(), hash.c_str());
+    if (!encrypted) return false;
+    return std::string(encrypted) == hash;
 }
 
 int UserMgmt::get_next_uid(const std::vector<User>& users) {
     int max_uid = 999; // Start regular users at 1000
     for (const auto& u : users) {
-        if (u.uid > max_uid && u.uid < 65534) max_uid = u.uid;
+        if (u.uid > (uid_t)max_uid && u.uid < 65534) max_uid = u.uid;
     }
     return max_uid + 1;
 }
@@ -157,7 +187,7 @@ int UserMgmt::get_next_uid(const std::vector<User>& users) {
 int UserMgmt::get_next_gid(const std::vector<Group>& groups) {
     int max_gid = 999;
     for (const auto& g : groups) {
-        if (g.gid > max_gid && g.gid < 65534) max_gid = g.gid;
+        if (g.gid > (gid_t)max_gid && g.gid < 65534) max_gid = g.gid;
     }
     return max_gid + 1;
 }
@@ -185,7 +215,7 @@ void UserMgmt::initialize_defaults() {
         std::cout << "[INIT] Creating default /etc/shadow..." << std::endl;
         std::ofstream s("/etc/shadow");
         // Root password 'root'
-        s << "root:" << hash_password("root") << ":19000:0:99999:7:::\n";
+        s << "root:" << hash_password("root") << ":19000:0:99999:7:::" << "\n";
         s.close();
         chmod("/etc/shadow", 0600);
     }

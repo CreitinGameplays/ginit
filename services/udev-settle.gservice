@@ -1,0 +1,16 @@
+service "udev-settle" {
+    meta {
+        description = "Wait for udev to settle"
+        deps {
+            after = ["udev-trigger"]
+            requires = ["udev-trigger"]
+        }
+    }
+
+    process {
+        type = "oneshot"
+        commands {
+            start = "/usr/bin/udevadm settle --timeout=30"
+        }
+    }
+}

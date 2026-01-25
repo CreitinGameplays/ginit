@@ -1,0 +1,20 @@
+service "udevd" {
+    meta {
+        description = "Userspace devfs daemon"
+    }
+
+    process {
+        type = "simple"
+        user = "root"
+        group = "root"
+
+        commands {
+            start = "/usr/sbin/udevd"
+        }
+
+        lifecycle {
+            restart_policy = "always"
+            restart_delay  = "2s"
+        }
+    }
+}

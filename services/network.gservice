@@ -1,0 +1,16 @@
+service "network" {
+    meta {
+        description = "Network Configuration"
+        deps {
+            after = ["udev-settle"]
+            requires = ["udev-settle"]
+        }
+    }
+
+    process {
+        type = "oneshot"
+        commands {
+            start = "/bin/ginit --configure-network"
+        }
+    }
+}

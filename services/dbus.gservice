@@ -2,7 +2,8 @@ service "dbus" {
     meta {
         description = "D-Bus System Message Bus"
         deps {
-            after = ["udevd"]
+            after = ["udev-settle"]
+            requires = ["udev-settle"]
         }
     }
 

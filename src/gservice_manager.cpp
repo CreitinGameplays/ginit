@@ -11,11 +11,25 @@
 #include <sys/stat.h>
 #include <thread>
 #include <sstream>
+#include <ctime>
+#include <iomanip>
 #include <pwd.h>
 #include <grp.h>
 #include <sys/prctl.h>
 
 namespace ginit {
+
+void log_message(const std::string& msg) {
+    auto now = std::time(nullptr);
+    auto tm = *std::localtime(&now);
+    std::cout << "[" << std::put_time(&tm, "%H:%M:%S") << "] " << msg << std::endl;
+}
+
+void log_error(const std::string& msg) {
+    auto now = std::time(nullptr);
+    auto tm = *std::localtime(&now);
+    std::cerr << "[" << std::put_time(&tm, "%H:%M:%S") << "] [ERR] " << msg << std::endl;
+}
 
 // Helper to parse duration strings like "5s", "100ms" into microseconds
 unsigned long parse_duration(const std::string& str) {
@@ -62,7 +76,7 @@ void GServiceManager::load_services_from_dir(const std::string& dir) {
                 std::string name = config->name;
                 services[name].config = std::move(config);
                 services[name].enabled = true; 
-                std::cout << "[GSERVICE] Loaded " << name << " from " << filename << std::endl;
+                log_message("[GSERVICE] Loaded " + name + " from " + filename);
             }
         }
     }
@@ -99,7 +113,7 @@ void GServiceManager::setup_security(const GService& config) {
             
             if (setuid(pwd->pw_uid) != 0) perror("setuid");
         } else {
-             std::cerr << "[GSERVICE] User " << config.process.user << " not found!" << std::endl;
+             log_error("[GSERVICE] User " + config.process.user + " not found!");
         }
     } else if (!config.process.group.empty()) {
          struct group* grp = getgrnam(config.process.group.c_str());
@@ -123,7 +137,7 @@ pid_t GServiceManager::spawn_process(const GService& config) {
 
     // Handle start_pre if it exists
     if (!config.process.commands.start_pre.empty()) {
-        std::cout << "[GSERVICE] Running start_pre for " << config.name << std::endl;
+        log_message("[GSERVICE] Running start_pre for " + config.name);
         
         pid_t pre_pid = fork();
         if (pre_pid == 0) {
@@ -143,7 +157,7 @@ pid_t GServiceManager::spawn_process(const GService& config) {
             int status;
             waitpid(pre_pid, &status, 0);
             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                 std::cerr << "[GSERVICE] start_pre failed for " << config.name << std::endl;
+                 log_error("[GSERVICE] start_pre failed for " + config.name);
                  return -1; 
             }
         }
@@ -174,40 +188,12 @@ pid_t GServiceManager::spawn_process(const GService& config) {
     return pid;
 }
 
-std::string GServiceManager::start_service(const std::string& name) {
-    if (services.find(name) == services.end()) {
-        // Try to load from available if not already loaded
-        std::string path = AVAILABLE_SERVICES_DIR + "/" + name + ".gservice";
-        if (access(path.c_str(), F_OK) == 0) {
-            auto config = GServiceParser::parse_file(path);
-            if (config) {
-                services[name].config = std::move(config);
-                services[name].enabled = false;
-            }
-        } else {
-            return "Error: Service '" + name + "' not found.\n";
-        }
-    }
-
-    auto& s = services[name];
-    if (s.running) return "Service '" + name + "' is already running (PID " + std::to_string(s.pid) + ").\n";
-
-    std::cout << "[GSERVICE] Starting " << name << "..." << std::endl;
-    s.pid = spawn_process(*(s.config));
-    if (s.pid > 0) {
-        s.running = true;
-        pid_to_name[s.pid] = name;
-        return "Started " + name + " (PID " + std::to_string(s.pid) + ").\n";
-    }
-    return "Failed to start " + name + ".\n";
-}
-
 std::string GServiceManager::stop_service(const std::string& name) {
     if (services.find(name) == services.end()) return "Error: Service '" + name + "' not found.\n";
     auto& s = services[name];
     if (!s.running) return "Service '" + name + "' is not running.\n";
 
-    std::cout << "[GSERVICE] Stopping " << name << " (PID " << s.pid << ")..." << std::endl;
+    log_message("[GSERVICE] Stopping " + name + " (PID " + std::to_string(s.pid) + ")...");
     kill(s.pid, SIGTERM);
     
     // Simple wait (non-blocking attempt)
@@ -241,7 +227,7 @@ std::string GServiceManager::enable_service(const std::string& name) {
         perror("symlink");
         return "Failed to enable " + name + ".\n";
     } else {
-        std::cout << "[GSERVICE] Enabled " << name << std::endl;
+        log_message("[GSERVICE] Enabled " + name);
         if (services.count(name)) services[name].enabled = true;
         return "Enabled " + name + ".\n";
     }
@@ -254,18 +240,107 @@ std::string GServiceManager::disable_service(const std::string& name) {
         perror("unlink");
         return "Failed to disable " + name + ".\n";
     } else {
-        std::cout << "[GSERVICE] Disabled " << name << std::endl;
+        log_message("[GSERVICE] Disabled " + name);
         if (services.count(name)) services[name].enabled = false;
         return "Disabled " + name + ".\n";
     }
 }
 
-void GServiceManager::start_enabled_services() {
-    for (auto& pair : services) {
-        if (pair.second.enabled && !pair.second.running) {
-            start_service(pair.first);
+std::vector<std::string> GServiceManager::get_service_order() {
+    std::map<std::string, bool> visited;
+    std::map<std::string, bool> stack;
+    std::vector<std::string> order;
+
+    for (const auto& pair : services) {
+        if (!visited[pair.first]) {
+            visit(pair.first, visited, stack, order);
         }
     }
+
+    return order;
+}
+
+void GServiceManager::visit(const std::string& name, std::map<std::string, bool>& visited, std::map<std::string, bool>& stack, std::vector<std::string>& order) {
+    visited[name] = true;
+    stack[name] = true;
+
+    if (services.count(name)) {
+        for (const auto& dep : services[name].config->meta.deps.after) {
+            if (services.count(dep)) {
+                if (!visited[dep]) {
+                    visit(dep, visited, stack, order);
+                }
+            }
+        }
+    }
+
+    stack[name] = false;
+    order.push_back(name);
+}
+
+void GServiceManager::start_enabled_services() {
+    std::vector<std::string> order = get_service_order();
+    for (const auto& name : order) {
+        if (services[name].enabled && !services[name].running) {
+            start_service(name);
+        }
+    }
+}
+
+std::string GServiceManager::start_service(const std::string& name) {
+    if (services.find(name) == services.end()) {
+        // Try to load from available if not already loaded
+        std::string path = AVAILABLE_SERVICES_DIR + "/" + name + ".gservice";
+        if (access(path.c_str(), F_OK) == 0) {
+            auto config = GServiceParser::parse_file(path);
+            if (config) {
+                services[name].config = std::move(config);
+                services[name].enabled = false;
+            }
+        } else {
+            return "Error: Service '" + name + "' not found.\n";
+        }
+    }
+
+    auto& s = services[name];
+    if (s.running) return "Service '" + name + "' is already running (PID " + std::to_string(s.pid) + ").\n";
+    if (s.finished_successfully && s.config->process.type == "oneshot") return "Oneshot service '" + name + "' has already finished successfully.\n";
+
+    // Handle 'Requires' dependencies
+    for (const auto& req : s.config->meta.deps.requires) {
+        if (services.find(req) == services.end() || (!services[req].running && !services[req].finished_successfully)) {
+            log_message("[GSERVICE] Starting requirement " + req + " for " + name);
+            start_service(req);
+            if (!services[req].running && !services[req].finished_successfully) {
+                 return "Failed to start requirement " + req + " for " + name + ".\n";
+            }
+        }
+    }
+
+    log_message("[GSERVICE] Starting " + name + "...");
+    s.pid = spawn_process(*(s.config));
+    if (s.pid > 0) {
+        if (s.config->process.type == "oneshot") {
+            int status;
+            waitpid(s.pid, &status, 0);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                log_message("[GSERVICE] Oneshot " + name + " finished successfully.");
+                s.running = false; 
+                s.finished_successfully = true;
+                return "Oneshot " + name + " finished successfully.\n";
+            } else {
+                log_error("[GSERVICE] Oneshot " + name + " failed.");
+                s.finished_successfully = false;
+                return "Oneshot " + name + " failed.\n";
+            }
+        } else {
+            s.running = true;
+            s.finished_successfully = false; // Reset if it was a re-start
+            pid_to_name[s.pid] = name;
+            return "Started " + name + " (PID " + std::to_string(s.pid) + ").\n";
+        }
+    }
+    return "Failed to start " + name + ".\n";
 }
 
 void GServiceManager::handle_process_death(pid_t pid, int status) {
@@ -276,7 +351,10 @@ void GServiceManager::handle_process_death(pid_t pid, int status) {
     s.running = false;
     pid_to_name.erase(pid);
 
-    std::cout << "[GSERVICE] Service " << name << " (pid " << pid << ") exited with status " << status << std::endl;
+    log_message("[GSERVICE] Service " + name + " (pid " + std::to_string(pid) + ") exited with status " + std::to_string(status));
+
+    // Do not supervise/restart oneshot services here, they are handled in start_service
+    if (s.config->process.type == "oneshot") return;
 
     // Handle restart delay
     unsigned long delay = parse_duration(s.config->process.lifecycle.restart_delay);
@@ -299,7 +377,7 @@ bool GServiceManager::is_managed_process(pid_t pid) const {
 }
 
 void GServiceManager::print_status() {
-    std::cout << get_status_str();
+    log_message(get_status_str());
 }
 
 std::string GServiceManager::get_status_str() {
@@ -311,7 +389,11 @@ std::string GServiceManager::get_status_str() {
     }
     for (const auto& pair : services) {
         const auto& s = pair.second;
-        ss << (s.running ? "[ RUNNING ] " : "[ STOPPED ] ") 
+        std::string status_label = "[ STOPPED ] ";
+        if (s.running) status_label = "[ RUNNING ] ";
+        else if (s.finished_successfully) status_label = "[ FINISHED ] ";
+
+        ss << status_label 
                   << pair.first << " (PID: " << (s.running ? std::to_string(s.pid) : "-") << ")" << std::endl;
         ss << "   Description: " << s.config->meta.description << std::endl;
     }
@@ -320,15 +402,18 @@ std::string GServiceManager::get_status_str() {
 
 void GServiceManager::print_service_status(const std::string& name) {
     if (services.find(name) == services.end()) {
-        std::cout << "Service " << name << " not found." << std::endl;
+        log_message("Service " + name + " not found.");
         return;
     }
     auto& s = services[name];
-    std::cout << "Service: " << name << std::endl;
-    std::cout << "  Status: " << (s.running ? "Running" : "Stopped") << std::endl;
-    if (s.running) std::cout << "  PID: " << s.pid << std::endl;
-    std::cout << "  Enabled: " << (s.enabled ? "Yes" : "No") << std::endl;
-    std::cout << "  Description: " << s.config->meta.description << std::endl;
+    std::stringstream ss;
+    ss << "Service: " << name << "\n";
+    std::string status_str = s.running ? "Running" : (s.finished_successfully ? "Finished" : "Stopped");
+    ss << "  Status: " << status_str << "\n";
+    if (s.running) ss << "  PID: " << s.pid << "\n";
+    ss << "  Enabled: " << (s.enabled ? "Yes" : "No") << "\n";
+    ss << "  Description: " << s.config->meta.description << "\n";
+    log_message(ss.str());
 }
 
 void GServiceManager::run_ipc_server() {
@@ -387,7 +472,8 @@ void GServiceManager::handle_ipc_client(int client_fd) {
                     auto& s = services[name];
                     std::stringstream status_ss;
                     status_ss << "Service: " << name << "\n";
-                    status_ss << "  Status: " << (s.running ? "Running" : "Stopped") << "\n";
+                    std::string status_str = s.running ? "Running" : (s.finished_successfully ? "Finished" : "Stopped");
+                    status_ss << "  Status: " << status_str << "\n";
                     if (s.running) status_ss << "  PID: " << s.pid << "\n";
                     status_ss << "  Enabled: " << (s.enabled ? "Yes" : "No") << "\n";
                     status_ss << "  Description: " << s.config->meta.description << "\n";
