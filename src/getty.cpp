@@ -70,7 +70,7 @@ int main(int argc, char* argv[]) {
     struct termios t;
     tcgetattr(STDIN_FILENO, &t);
     t.c_cc[VINTR] = 3;   // Ctrl+C
-    t.c_cc[VQUIT] = 28;  // Ctrl+\
+    t.c_cc[VQUIT] = 28;  // Ctrl+Backslash
     t.c_cc[VERASE] = 127;
     t.c_cc[VKILL] = 21;
     t.c_cc[VEOF] = 4;
@@ -87,14 +87,39 @@ int main(int argc, char* argv[]) {
     std::ifstream issue("/etc/issue");
     if (issue) {
         std::string line;
+        std::string tty_name = tty_dev;
+        if (tty_name.find("/dev/") == 0) {
+            tty_name = tty_name.substr(5);
+        }
+        
+        char hostname[256];
+        std::string host_str = "GeminiOS";
+        if (gethostname(hostname, sizeof(hostname)) == 0) {
+            host_str = hostname;
+        }
+
         while (std::getline(issue, line)) {
-            // Very basic replacement for \n, \l etc could be added here
-            std::cout << line << std::endl;
+            std::string parsed_line = "";
+            for (size_t i = 0; i < line.length(); ++i) {
+                if (line[i] == '\\' && i + 1 < line.length()) {
+                    char next = line[i + 1];
+                    switch (next) {
+                        case 'l': parsed_line += tty_name; break;
+                        case 'n': parsed_line += host_str; break;
+                        case '\\': parsed_line += '\\'; break;
+                        default: parsed_line += line[i]; parsed_line += next; break;
+                    }
+                    i++; 
+                } else {
+                    parsed_line += line[i];
+                }
+            }
+            std::cout << parsed_line << std::endl;
         }
     } else {
         std::cout << OS_NAME << " " << OS_VERSION << " (" << OS_ARCH << ")" << std::endl;
+        std::cout << tty_dev << std::endl << std::endl;
     }
-    std::cout << tty_dev << std::endl << std::endl;
     std::cout << std::flush;
 
     // Execute login
