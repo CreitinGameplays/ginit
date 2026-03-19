@@ -27,11 +27,13 @@ int main(int argc, char* argv[]) {
     }
     
     std::cerr << "[GETTY] Target TTY: " << tty_dev << std::endl;
+    std::cerr << std::flush;
 
     // Open TTY
     // Use O_NOCTTY to avoid acquiring it as controlling tty immediately
     // We will do it manually with TIOCSCTTY
     std::cerr << "[GETTY] Opening " << tty_dev << "..." << std::endl;
+    std::cerr << std::flush;
     int fd = open(tty_dev.c_str(), O_RDWR | O_NOCTTY);
     if (fd < 0) {
         perror("[GETTY] open tty failed");
@@ -99,6 +101,11 @@ int main(int argc, char* argv[]) {
         }
 
         while (std::getline(issue, line)) {
+            // Remove trailing \r if present (for Windows-style line endings)
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+
             std::string parsed_line = "";
             for (size_t i = 0; i < line.length(); ++i) {
                 if (line[i] == '\\' && i + 1 < line.length()) {
@@ -106,8 +113,13 @@ int main(int argc, char* argv[]) {
                     switch (next) {
                         case 'l': parsed_line += tty_name; break;
                         case 'n': parsed_line += host_str; break;
+                        case 's': parsed_line += OS_NAME; break;
+                        case 'v': parsed_line += OS_VERSION; break;
                         case '\\': parsed_line += '\\'; break;
-                        default: parsed_line += line[i]; parsed_line += next; break;
+                        default: 
+                            parsed_line += line[i]; 
+                            parsed_line += next; 
+                            break;
                     }
                     i++; 
                 } else {
