@@ -262,11 +262,23 @@ std::string format_speed(double bytes_per_sec) {
     return std::to_string((int)bytes_per_sec) + " Bps";
 }
 
-bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const HttpOptions& opts);
+std::string trim_copy(const std::string& value) {
+    size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
 
-bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& opts) {
+void set_error(std::string* error_out, const std::string& message) {
+    if (error_out) *error_out = message;
+}
+
+bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const HttpOptions& opts, std::string* error_out);
+
+bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& opts, std::string* error_out) {
     int attempts = 0;
     int max_attempts = opts.retry_count + 1;
+    std::string last_error;
     
     while (attempts < max_attempts) {
         if (g_stop_sig) return false;
@@ -282,7 +294,8 @@ bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& o
         // Actually, if it's an ofstream, we might want to truncate it.
         // But ostream doesn't have truncate.
         
-        if (HttpRequestInternal(url, out, opts)) {
+        if (HttpRequestInternal(url, out, opts, &last_error)) {
+            set_error(error_out, "");
             return true;
         }
         
@@ -290,12 +303,14 @@ bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& o
         if (g_stop_sig) return false;
     }
     
+    set_error(error_out, last_error);
     return false;
 }
 
-bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const HttpOptions& opts) {
+bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const HttpOptions& opts, std::string* error_out) {
     if (opts.max_redirects < 0) {
         if (opts.verbose) std::cerr << "[NET] Max redirects reached" << std::endl;
+        set_error(error_out, "too many redirects");
         return false;
     }
 
@@ -333,6 +348,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         port = 443;
     } else if (protocol != "http") {
         if (opts.verbose) std::cerr << "[ERR] Unsupported protocol: " << protocol << std::endl;
+        set_error(error_out, "unsupported protocol: " + protocol);
         return false;
     }
 
@@ -412,6 +428,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     std::string ip = ResolveDNS(connect_host);
     if (ip.empty()) {
         if (opts.verbose) std::cerr << "[ERR] Could not resolve: " << connect_host << std::endl;
+        set_error(error_out, "could not resolve " + connect_host);
         return false;
     }
     if (opts.verbose) std::cerr << "[NET] Connecting to IP: " << ip << std::endl;
@@ -422,6 +439,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         if (opts.verbose) perror("[ERR] Socket creation failed");
+        set_error(error_out, std::string("socket creation failed: ") + strerror(errno));
         return false;
     }
 
@@ -433,6 +451,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
         if (opts.verbose) perror("[ERR] Connection failed");
+        set_error(error_out, std::string("connection failed: ") + strerror(errno));
         close(sock);
         return false;
     }
@@ -456,6 +475,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
             tmp[len] = 0;
             if (std::string(tmp).find("200") == std::string::npos) {
                 if (opts.verbose) std::cerr << "[ERR] Proxy CONNECT failed: " << tmp << std::endl;
+                set_error(error_out, "proxy CONNECT failed");
                 close(sock); return false;
             }
         }
@@ -466,6 +486,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         ctx = SSL_CTX_new(TLS_client_method());
         if (!ctx) {
             if (opts.verbose) std::cerr << "[ERR] SSL Context failed" << std::endl;
+            set_error(error_out, "failed to initialize SSL context");
             close(sock); return false;
         }
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -476,6 +497,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
 
         if (SSL_connect(ssl) <= 0) {
             if (opts.verbose) ERR_print_errors_fp(stderr);
+            set_error(error_out, "TLS handshake failed");
             SSL_free(ssl); SSL_CTX_free(ctx); close(sock);
             return false;
         }
@@ -502,12 +524,14 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     if (use_ssl) {
         if (SSL_write(ssl, req.c_str(), req.length()) <= 0) {
             if (opts.verbose) ERR_print_errors_fp(stderr);
+            set_error(error_out, "failed to send HTTPS request");
             SSL_free(ssl); SSL_CTX_free(ctx); close(sock);
             return false;
         }
     } else {
         if (write(sock, req.c_str(), req.length()) < 0) {
             if (opts.verbose) perror("[ERR] Write failed");
+            set_error(error_out, std::string("failed to send HTTP request: ") + strerror(errno));
             close(sock); return false;
         }
     }
@@ -523,6 +547,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     
     auto start_time = std::chrono::steady_clock::now();
     auto last_update = start_time;
+    auto last_progress = start_time;
     
     // Set a timeout for the socket to allow checking signals periodically
     struct timeval tv = {1, 0}; // 1 second timeout
@@ -549,34 +574,98 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                 // Check if it's a real error or just clean close
                 if (ssl_err == SSL_ERROR_SYSCALL && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
                      if (errno == EINTR) continue; // Signal handled, loop will check g_stop_sig
-                     if (errno == EAGAIN || errno == EWOULDBLOCK) continue; // Timeout, check g_stop_sig
+                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                         auto now = std::chrono::steady_clock::now();
+                         auto stalled_for = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count();
+                         if (stalled_for >= opts.timeout) {
+                             if (opts.verbose) std::cerr << "[ERR] Download stalled for " << stalled_for << " seconds." << std::endl;
+                             set_error(error_out, "timed out after " + std::to_string(stalled_for) + " seconds without receiving data");
+                             if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                             close(sock);
+                             return false;
+                         }
+                         continue; // Timeout, check g_stop_sig
+                     }
+                }
+                if (ssl_err != SSL_ERROR_ZERO_RETURN) {
+                    set_error(error_out, "TLS read failed");
                 }
                 break; // Real error or close
             } else {
                 if (bytes < 0) {
                      if (errno == EINTR) continue;
-                     if (errno == EAGAIN || errno == EWOULDBLOCK) continue; 
+                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                         auto now = std::chrono::steady_clock::now();
+                         auto stalled_for = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count();
+                         if (stalled_for >= opts.timeout) {
+                             if (opts.verbose) std::cerr << "[ERR] Download stalled for " << stalled_for << " seconds." << std::endl;
+                             set_error(error_out, "timed out after " + std::to_string(stalled_for) + " seconds without receiving data");
+                             close(sock);
+                             return false;
+                         }
+                         continue;
+                     }
+                     set_error(error_out, std::string("socket read failed: ") + strerror(errno));
                 }
                 break; // EOF or Error
             }
         }
+
+        last_progress = std::chrono::steady_clock::now();
 
         if (!header_parsed && !opts.include_headers) {
              header_buffer.append(buffer, bytes);
              size_t header_end = header_buffer.find("\r\n\r\n");
              if (header_end != std::string::npos) {
                  std::string headers = header_buffer.substr(0, header_end);
+                 std::string lower_headers = headers;
+                 std::transform(lower_headers.begin(), lower_headers.end(), lower_headers.begin(), ::tolower);
 
                  // Check HTTP Status
                  size_t first_line_end = headers.find("\r\n");
                  if (first_line_end != std::string::npos) {
                      std::string status_line = headers.substr(0, first_line_end);
+                     bool is_redirect = status_line.find(" 302 ") != std::string::npos ||
+                                        status_line.find(" 301 ") != std::string::npos;
+                     if (is_redirect) {
+                         if (!opts.follow_location) {
+                             if (opts.verbose) std::cerr << "[ERR] Redirect received but redirect following is disabled: " << status_line << std::endl;
+                             set_error(error_out, "redirect received but follow_location is disabled");
+                             if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                             close(sock);
+                             return false;
+                         }
+
+                         size_t loc_pos = lower_headers.find("location: ");
+                         if (loc_pos == std::string::npos) {
+                             if (opts.verbose) std::cerr << "[ERR] Redirect response missing Location header." << std::endl;
+                             set_error(error_out, "redirect response missing Location header");
+                             if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                             close(sock);
+                             return false;
+                         }
+
+                         size_t loc_start = loc_pos + 10;
+                         size_t loc_end = lower_headers.find("\r\n", loc_start);
+                         std::string redirect_url = trim_copy(headers.substr(loc_start, loc_end - loc_start));
+                         if (!redirect_url.empty() && redirect_url[0] == '/') {
+                             redirect_url = protocol + "://" + host + redirect_url;
+                         }
+
+                         if (opts.verbose) std::cerr << "[NET] Following redirect to " << redirect_url << std::endl;
+                         if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                         close(sock);
+
+                         HttpOptions redirect_opts = opts;
+                         redirect_opts.max_redirects = opts.max_redirects - 1;
+                         return HttpRequestInternal(redirect_url, out, redirect_opts, error_out);
+                     }
+
                      if (status_line.find(" 200 ") == std::string::npos && 
                          status_line.find(" 201 ") == std::string::npos && 
-                         status_line.find(" 206 ") == std::string::npos &&
-                         status_line.find(" 302 ") == std::string::npos &&
-                         status_line.find(" 301 ") == std::string::npos) {
+                         status_line.find(" 206 ") == std::string::npos) {
                          if (opts.verbose) std::cerr << "[ERR] HTTP Status Error: " << status_line << std::endl;
+                         set_error(error_out, "HTTP status error: " + status_line);
                          if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
                          close(sock);
                          return false; 
@@ -584,9 +673,6 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                  }
                  
                  // Look for Content-Length
-                 std::string lower_headers = headers;
-                 std::transform(lower_headers.begin(), lower_headers.end(), lower_headers.begin(), ::tolower);
-                 
                  size_t cl_pos = lower_headers.find("content-length: ");
                  if (cl_pos != std::string::npos) {
                      size_t val_start = cl_pos + 16;
@@ -635,6 +721,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     
     // Check if we were interrupted
     if (g_stop_sig) {
+         set_error(error_out, "interrupted by signal");
          if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
          close(sock);
          return false;
@@ -665,8 +752,10 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     close(sock);
     if (content_length > 0 && total_read != content_length && opts.method != "HEAD") {
         if (opts.verbose) std::cerr << "[ERR] Incomplete download. Expected " << content_length << " bytes, got " << total_read << std::endl;
+        set_error(error_out, "incomplete download (" + std::to_string(total_read) + "/" + std::to_string(content_length) + " bytes)");
         return false;
     }
+    set_error(error_out, "");
     return true;
 }
 
@@ -715,9 +804,15 @@ bool DownloadWorker(std::string url, std::string dest, long start, long end, int
     return false;
 }
 
-bool DownloadFileParallel(std::string url, const std::string& dest_path, long content_length, bool verbose) {
+void cleanup_download_artifacts(const std::vector<std::string>& paths) {
+    for (const auto& path : paths) remove(path.c_str());
+}
+
+bool DownloadFileParallel(std::string url, const std::string& dest_path, long content_length, bool verbose, std::string* error_out) {
     int num_threads = 4;
     long part_size = content_length / num_threads;
+    std::string temp_base = dest_path + ".partdownload";
+    std::string temp_output = temp_base + ".merged";
     
     if (verbose) std::cout << "Parallel Download: " << num_threads << " threads, " << (content_length/1024/1024) << " MB" << std::endl;
 
@@ -728,7 +823,7 @@ bool DownloadFileParallel(std::string url, const std::string& dest_path, long co
     for(int i=0; i<num_threads; i++) {
         long start = i * part_size;
         long end = (i == num_threads - 1) ? content_length - 1 : (start + part_size - 1);
-        std::string temp_file = dest_path + ".part" + std::to_string(i);
+        std::string temp_file = temp_base + ".part" + std::to_string(i);
         temp_files.push_back(temp_file);
         
         futures.push_back(std::async(std::launch::async, DownloadWorker, url, temp_file, start, end, i, verbose));
@@ -743,30 +838,48 @@ bool DownloadFileParallel(std::string url, const std::string& dest_path, long co
     if (success) {
         // Merge
         if (verbose) std::cout << "Merging parts..." << std::endl;
-        std::ofstream final_out(dest_path, std::ios::binary);
-        if (!final_out) success = false;
+        std::ofstream final_out(temp_output, std::ios::binary | std::ios::trunc);
+        if (!final_out) {
+            set_error(error_out, "could not create temporary output file " + temp_output);
+            success = false;
+        }
         else {
             for(const auto& tf : temp_files) {
                 std::ifstream part_in(tf, std::ios::binary);
+                if (!part_in) {
+                    set_error(error_out, "missing download part " + tf);
+                    success = false;
+                    break;
+                }
                 final_out << part_in.rdbuf();
                 part_in.close();
-                remove(tf.c_str());
+            }
+            final_out.close();
+            if (success && rename(temp_output.c_str(), dest_path.c_str()) != 0) {
+                set_error(error_out, std::string("failed to finalize download: ") + strerror(errno));
+                success = false;
             }
         }
-    } else {
-        // Cleanup
-        for(const auto& tf : temp_files) remove(tf.c_str());
     }
-    
+
+    temp_files.push_back(temp_output);
+    cleanup_download_artifacts(temp_files);
+    if (!success && error_out && error_out->empty()) {
+        set_error(error_out, "parallel download failed");
+    }
     return success;
 }
 
-bool DownloadFile(std::string url, const std::string& dest_path, bool verbose) {
+bool DownloadFile(std::string url, const std::string& dest_path, bool verbose, std::string* error_out) {
+    set_error(error_out, "");
+
     // Check if parallel download is suitable
     long size = GetRemoteFileSize(url);
     if (size > 5 * 1024 * 1024) { // > 5 MB use parallel
-        if (DownloadFileParallel(url, dest_path, size, verbose)) return true;
+        std::string parallel_error;
+        if (DownloadFileParallel(url, dest_path, size, verbose, &parallel_error)) return true;
         if (verbose) std::cerr << "Parallel download failed, falling back to single connection..." << std::endl;
+        set_error(error_out, parallel_error);
     }
 
     HttpOptions opts;
@@ -778,6 +891,8 @@ bool DownloadFile(std::string url, const std::string& dest_path, bool verbose) {
     // Robust Retry Loop (Manual)
     int attempts = 0;
     int max_attempts = 5; // Increased default retries
+    std::string temp_path = dest_path + ".part";
+    std::string last_error;
     
     while (attempts < max_attempts) {
         if (g_stop_sig) return false;
@@ -787,20 +902,43 @@ bool DownloadFile(std::string url, const std::string& dest_path, bool verbose) {
              sleep(2);
         }
 
+        remove(temp_path.c_str());
+
         // Always truncate/reset file on each attempt
-        std::ofstream outfile(dest_path, std::ios::binary);
+        std::ofstream outfile(temp_path, std::ios::binary | std::ios::trunc);
         if (!outfile) {
-            std::cerr << "E: Could not open output file: " << dest_path << std::endl;
+            std::string message = "Could not open output file: " + temp_path;
+            std::cerr << "E: " << message << std::endl;
+            set_error(error_out, message);
             return false;
         }
 
-        if (HttpRequest(url, outfile, opts)) {
-            return true;
+        if (HttpRequest(url, outfile, opts, &last_error)) {
+            outfile.close();
+            if (rename(temp_path.c_str(), dest_path.c_str()) != 0) {
+                last_error = std::string("failed to finalize download: ") + strerror(errno);
+                remove(temp_path.c_str());
+            } else {
+                set_error(error_out, "");
+                return true;
+            }
+        } else {
+            outfile.close();
+            remove(temp_path.c_str());
         }
-        
-        outfile.close(); // Flush and close
+
+        if (attempts + 1 >= max_attempts) {
+            break;
+        }
+
+        if (verbose && !last_error.empty()) {
+            std::cerr << "[NET] Last failure: " << last_error << std::endl;
+        }
+
         attempts++;
     }
-    
+
+    remove(temp_path.c_str());
+    set_error(error_out, last_error);
     return false;
 }

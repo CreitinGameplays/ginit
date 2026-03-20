@@ -25,7 +25,7 @@ struct HttpOptions {
 };
 
 // Generic HTTP Request
-bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& opts);
+bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& opts, std::string* error_out = nullptr);
 
 // Configure Network Interface (eth0)
 int ConfigureNetwork();
@@ -34,6 +34,6 @@ int ConfigureNetwork();
 std::string ResolveDNS(const std::string& host);
 
 // Downloads a file from an HTTPS URL to a local path
-bool DownloadFile(std::string url, const std::string& dest_path, bool verbose = false);
+bool DownloadFile(std::string url, const std::string& dest_path, bool verbose = false, std::string* error_out = nullptr);
 
 #endif // NETWORK_H
