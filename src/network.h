@@ -33,7 +33,15 @@ int ConfigureNetwork();
 // Resolve Hostname to IP
 std::string ResolveDNS(const std::string& host);
 
-// Downloads a file from an HTTPS URL to a local path
-bool DownloadFile(std::string url, const std::string& dest_path, bool verbose = false, std::string* error_out = nullptr);
+// Downloads a file from an HTTPS URL to a local path.
+// `verbose` enables low-level network logging.
+// `show_progress` controls the built-in per-file progress bar.
+bool DownloadFile(
+    std::string url,
+    const std::string& dest_path,
+    bool verbose = false,
+    std::string* error_out = nullptr,
+    bool show_progress = true
+);
 
 #endif // NETWORK_H

@@ -870,7 +870,7 @@ bool DownloadFileParallel(std::string url, const std::string& dest_path, long co
     return success;
 }
 
-bool DownloadFile(std::string url, const std::string& dest_path, bool verbose, std::string* error_out) {
+bool DownloadFile(std::string url, const std::string& dest_path, bool verbose, std::string* error_out, bool show_progress) {
     set_error(error_out, "");
 
     // Check if parallel download is suitable
@@ -884,7 +884,7 @@ bool DownloadFile(std::string url, const std::string& dest_path, bool verbose, s
 
     HttpOptions opts;
     opts.verbose = verbose;
-    opts.show_progress = !verbose; 
+    opts.show_progress = show_progress && !verbose;
     opts.follow_location = true;
     opts.retry_count = 0; // Disable inner retry
 
