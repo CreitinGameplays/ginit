@@ -1,0 +1,29 @@
+service "elogind" {
+    meta {
+        description = "elogind session and seat manager"
+        deps {
+            after = ["dbus", "udev-settle"]
+            requires = ["dbus", "udev-settle"]
+        }
+    }
+
+    process {
+        type = "simple"
+        user = "root"
+        group = "root"
+
+        commands {
+            start_pre = "mkdir -p /run/systemd /run/systemd/inhibit /run/systemd/seats /run/systemd/sessions /run/systemd/users /run/user /var/lib/elogind"
+            start = "/usr/libexec/geminios/elogind-launch"
+        }
+
+        lifecycle {
+            restart_policy = "always"
+            restart_delay = "2s"
+        }
+    }
+
+    install {
+        wanted_by = ["multi-user.target"]
+    }
+}

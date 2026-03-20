@@ -57,6 +57,8 @@ void ensure_fhs() {
         "/mnt", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", 
         "/sys", "/tmp", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/locale", "/usr/lib/gconv", "/usr/local", 
         "/usr/share", "/var", "/var/lib", "/var/log", "/var/tmp", "/var/repo",
+        "/run/lock", "/run/user", "/run/systemd", "/run/systemd/inhibit", "/run/systemd/seats",
+        "/run/systemd/sessions", "/run/systemd/users", "/var/lib/elogind",
         "/usr/share/X11", "/usr/share/X11/xkb", "/usr/share/X11/xkb/compiled"
     };
     
@@ -243,6 +245,13 @@ safe_mkdir("/etc/ginit/services");
 safe_mkdir("/etc/ginit/services/system");
 safe_mkdir("/usr/lib/ginit");
 safe_mkdir("/usr/lib/ginit/services");
+safe_mkdir("/run/systemd");
+safe_mkdir("/run/systemd/inhibit");
+safe_mkdir("/run/systemd/seats");
+safe_mkdir("/run/systemd/sessions");
+safe_mkdir("/run/systemd/users");
+safe_mkdir("/run/user");
+safe_mkdir("/var/lib/elogind");
 
 // Copy default services to system directory if not present
 // This is a bit of a hack for first boot, but okay for now.
@@ -258,6 +267,7 @@ service_manager.enable_service("udev-trigger");
 service_manager.enable_service("udev-settle");
 service_manager.enable_service("network");
 service_manager.enable_service("dbus");
+service_manager.enable_service("elogind");
 
 std::cerr << "[GINIT] Starting system services..." << std::endl;
 service_manager.start_enabled_services();

@@ -1,6 +1,8 @@
-CXX = g++
-CXXFLAGS += -Wall -Wextra -O2 -I./src
-LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt
+CXX ?= g++
+CPPFLAGS += -I./src
+CXXFLAGS ?= -Wall -Wextra -O2
+COMMON_LDLIBS += -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt
+LOGIN_LDLIBS += -lpam -lpam_misc
 
 SRCDIR = src
 OBJDIR = obj
@@ -26,16 +28,16 @@ $(LIBRARY): $(LIB_OBJS)
 	ar rcs $@ $^
 
 $(BINDIR)/ginit: $(GINIT_OBJS) $(LIBRARY)
-	$(CXX) $(CXXFLAGS) -o $@ $(GINIT_OBJS) $(LIBRARY) $(LDFLAGS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(GINIT_OBJS) $(LIBRARY) $(LDFLAGS) $(COMMON_LDLIBS)
 
 $(BINDIR)/getty: $(GETTY_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(BINDIR)/login: $(LOGIN_OBJS) $(LIBRARY)
-	$(CXX) $(CXXFLAGS) -o $@ $(LOGIN_OBJS) $(LIBRARY) $(LDFLAGS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(LOGIN_OBJS) $(LIBRARY) $(LDFLAGS) $(COMMON_LDLIBS) $(LOGIN_LDLIBS)
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 install: all
 	mkdir -p $(DESTDIR)/bin $(DESTDIR)/sbin

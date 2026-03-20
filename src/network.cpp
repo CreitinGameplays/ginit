@@ -691,7 +691,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
              total_read += bytes;
         }
         
-        if (opts.show_progress && header_parsed) {
+        if ((opts.show_progress || opts.progress_callback) && header_parsed) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
             auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
@@ -699,21 +699,28 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
             if (delta > 200 || bytes <= 0) { // Update every 200ms
                  double speed = 0;
                  if (elapsed > 0) speed = (double)total_read * 1000.0 / elapsed;
-                 
-                 int percent = 0;
-                 if (content_length > 0) percent = (int)((total_read * 100) / content_length);
-                 if (percent > 100) percent = 100;
 
-                 // Bar: [===              ]
-                 int bar_width = 25;
-                 int filled = (percent * bar_width) / 100;
-                 
-                 std::cout << "\r[";
-                 for(int i=0; i<bar_width; i++) {
-                     if (i < filled) std::cout << "=";
-                     else std::cout << " ";
+                 if (opts.progress_callback) {
+                     opts.progress_callback(static_cast<size_t>(total_read), static_cast<size_t>(std::max<long>(0, content_length)), speed);
                  }
-                 std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
+
+                 if (opts.show_progress) {
+                     int percent = 0;
+                     if (content_length > 0) percent = (int)((total_read * 100) / content_length);
+                     if (percent > 100) percent = 100;
+
+                     // Bar: [===              ]
+                     int bar_width = 25;
+                     int filled = (percent * bar_width) / 100;
+
+                     std::cout << "\r[";
+                     for(int i=0; i<bar_width; i++) {
+                         if (i < filled) std::cout << "=";
+                         else std::cout << " ";
+                     }
+                     std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
+                 }
+
                  last_update = now;
             }
         }
@@ -728,18 +735,24 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     }
 
     // Force final progress update to 100% if valid download
-    if (opts.show_progress && header_parsed && content_length > 0 && total_read >= content_length) {
+    if ((opts.show_progress || opts.progress_callback) && header_parsed && content_length > 0 && total_read >= content_length) {
          auto now = std::chrono::steady_clock::now();
          auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
          double speed = 0;
          if (elapsed > 0) speed = (double)total_read * 1000.0 / elapsed;
-         
-         int percent = 100;
-         int bar_width = 25;
-         
-         std::cout << "\r[";
-         for(int i=0; i<bar_width; i++) std::cout << "=";
-         std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
+
+         if (opts.progress_callback) {
+             opts.progress_callback(static_cast<size_t>(total_read), static_cast<size_t>(content_length), speed);
+         }
+
+         if (opts.show_progress) {
+             int percent = 100;
+             int bar_width = 25;
+
+             std::cout << "\r[";
+             for(int i=0; i<bar_width; i++) std::cout << "=";
+             std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
+         }
     }
 
     if (opts.show_progress) std::cout << std::endl;
@@ -870,12 +883,19 @@ bool DownloadFileParallel(std::string url, const std::string& dest_path, long co
     return success;
 }
 
-bool DownloadFile(std::string url, const std::string& dest_path, bool verbose, std::string* error_out, bool show_progress) {
+bool DownloadFile(
+    std::string url,
+    const std::string& dest_path,
+    bool verbose,
+    std::string* error_out,
+    bool show_progress,
+    std::function<void(size_t, size_t, double)> progress_callback
+) {
     set_error(error_out, "");
 
     // Check if parallel download is suitable
     long size = GetRemoteFileSize(url);
-    if (size > 5 * 1024 * 1024) { // > 5 MB use parallel
+    if (size > 5 * 1024 * 1024 && !show_progress && !progress_callback) { // > 5 MB use parallel when no live UI is attached
         std::string parallel_error;
         if (DownloadFileParallel(url, dest_path, size, verbose, &parallel_error)) return true;
         if (verbose) std::cerr << "Parallel download failed, falling back to single connection..." << std::endl;
@@ -885,6 +905,7 @@ bool DownloadFile(std::string url, const std::string& dest_path, bool verbose, s
     HttpOptions opts;
     opts.verbose = verbose;
     opts.show_progress = show_progress && !verbose;
+    opts.progress_callback = std::move(progress_callback);
     opts.follow_location = true;
     opts.retry_count = 0; // Disable inner retry
 

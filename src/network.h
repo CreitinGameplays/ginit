@@ -2,6 +2,7 @@
 #define NETWORK_H
 
 #include <string>
+#include <functional>
 #include <iostream>
 #include <vector>
 
@@ -22,6 +23,7 @@ struct HttpOptions {
     std::string auth;
     std::string data;
     std::vector<std::string> headers;
+    std::function<void(size_t, size_t, double)> progress_callback;
 };
 
 // Generic HTTP Request
@@ -44,7 +46,8 @@ bool DownloadFile(
     const std::string& dest_path,
     bool verbose = false,
     std::string* error_out = nullptr,
-    bool show_progress = true
+    bool show_progress = true,
+    std::function<void(size_t, size_t, double)> progress_callback = nullptr
 );
 
 #endif // NETWORK_H
