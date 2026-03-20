@@ -33,6 +33,9 @@ int ConfigureNetwork();
 // Resolve Hostname to IP
 std::string ResolveDNS(const std::string& host);
 
+// Query the remote object size using an HTTP HEAD request.
+long GetRemoteFileSize(std::string url);
+
 // Downloads a file from an HTTPS URL to a local path.
 // `verbose` enables low-level network logging.
 // `show_progress` controls the built-in per-file progress bar.
