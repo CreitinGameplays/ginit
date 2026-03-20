@@ -3,6 +3,16 @@ CPPFLAGS += -I./src
 CXXFLAGS ?= -Wall -Wextra -O2
 COMMON_LDLIBS += -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt
 LOGIN_LDLIBS += -lpam -lpam_misc
+TARGET_RUNTIME_LD :=
+
+TARGET_CXX_VERSION := $(shell find $(ROOTFS)/usr/include/c++ -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$$' | sort -V | tail -n1)
+ifneq ($(strip $(TARGET_CXX_VERSION)),)
+CPPFLAGS += -nostdinc++
+CPPFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
+CPPFLAGS += -isystem $(ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
+CPPFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
+TARGET_RUNTIME_LD += $(ROOTFS)/lib64/ld-linux-x86-64.so.2
+endif
 
 SRCDIR = src
 OBJDIR = obj
@@ -28,13 +38,13 @@ $(LIBRARY): $(LIB_OBJS)
 	ar rcs $@ $^
 
 $(BINDIR)/ginit: $(GINIT_OBJS) $(LIBRARY)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(GINIT_OBJS) $(LIBRARY) $(LDFLAGS) $(COMMON_LDLIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(GINIT_OBJS) $(LIBRARY) $(LDFLAGS) $(COMMON_LDLIBS) $(TARGET_RUNTIME_LD)
 
 $(BINDIR)/getty: $(GETTY_OBJS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(TARGET_RUNTIME_LD)
 
 $(BINDIR)/login: $(LOGIN_OBJS) $(LIBRARY)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(LOGIN_OBJS) $(LIBRARY) $(LDFLAGS) $(COMMON_LDLIBS) $(LOGIN_LDLIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(LOGIN_OBJS) $(LIBRARY) $(LDFLAGS) $(COMMON_LDLIBS) $(LOGIN_LDLIBS) $(TARGET_RUNTIME_LD)
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
