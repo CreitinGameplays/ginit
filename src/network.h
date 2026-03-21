@@ -24,6 +24,9 @@ struct HttpOptions {
     std::string data;
     std::vector<std::string> headers;
     std::function<void(size_t, size_t, double)> progress_callback;
+    size_t progress_base_bytes = 0;
+    size_t progress_total_hint = 0;
+    long resume_from = 0;
 };
 
 // Generic HTTP Request
@@ -47,7 +50,8 @@ bool DownloadFile(
     bool verbose = false,
     std::string* error_out = nullptr,
     bool show_progress = true,
-    std::function<void(size_t, size_t, double)> progress_callback = nullptr
+    std::function<void(size_t, size_t, double)> progress_callback = nullptr,
+    size_t* bytes_transferred_out = nullptr
 );
 
 #endif // NETWORK_H

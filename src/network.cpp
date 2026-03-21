@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <net/route.h>
 #include <netdb.h>
@@ -541,6 +542,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     int bytes;
     
     long content_length = -1;
+    long content_range_total = -1;
     long total_read = 0;
     std::string header_buffer;
     bool header_parsed = false;
@@ -627,6 +629,10 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                      std::string status_line = headers.substr(0, first_line_end);
                      bool is_redirect = status_line.find(" 302 ") != std::string::npos ||
                                         status_line.find(" 301 ") != std::string::npos;
+                     bool is_partial = status_line.find(" 206 ") != std::string::npos;
+                     bool is_ok = status_line.find(" 200 ") != std::string::npos ||
+                                  status_line.find(" 201 ") != std::string::npos ||
+                                  is_partial;
                      if (is_redirect) {
                          if (!opts.follow_location) {
                              if (opts.verbose) std::cerr << "[ERR] Redirect received but redirect following is disabled: " << status_line << std::endl;
@@ -661,14 +667,23 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                          return HttpRequestInternal(redirect_url, out, redirect_opts, error_out);
                      }
 
-                     if (status_line.find(" 200 ") == std::string::npos && 
-                         status_line.find(" 201 ") == std::string::npos && 
-                         status_line.find(" 206 ") == std::string::npos) {
+                     if (!is_ok) {
                          if (opts.verbose) std::cerr << "[ERR] HTTP Status Error: " << status_line << std::endl;
                          set_error(error_out, "HTTP status error: " + status_line);
                          if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
                          close(sock);
                          return false; 
+                     }
+
+                     if (opts.resume_from > 0 && !is_partial) {
+                         if (opts.verbose) {
+                             std::cerr << "[ERR] Resume request was not honored by server: "
+                                       << status_line << std::endl;
+                         }
+                         set_error(error_out, "resume request not honored");
+                         if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                         close(sock);
+                         return false;
                      }
                  }
                  
@@ -679,6 +694,22 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                      size_t val_end = lower_headers.find("\r\n", val_start);
                      if (val_end != std::string::npos) {
                          content_length = std::atol(headers.substr(val_start, val_end - val_start).c_str());
+                     }
+                 }
+
+                 size_t cr_pos = lower_headers.find("content-range: ");
+                 if (cr_pos != std::string::npos) {
+                     size_t val_start = cr_pos + 15;
+                     size_t val_end = lower_headers.find("\r\n", val_start);
+                     if (val_end != std::string::npos) {
+                         std::string range_value = trim_copy(headers.substr(val_start, val_end - val_start));
+                         size_t slash_pos = range_value.rfind('/');
+                         if (slash_pos != std::string::npos) {
+                             std::string total_str = trim_copy(range_value.substr(slash_pos + 1));
+                             if (!total_str.empty() && total_str != "*") {
+                                 content_range_total = std::atol(total_str.c_str());
+                             }
+                         }
                      }
                  }
                  
@@ -699,14 +730,23 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
             if (delta > 200 || bytes <= 0) { // Update every 200ms
                  double speed = 0;
                  if (elapsed > 0) speed = (double)total_read * 1000.0 / elapsed;
+                 size_t progress_total = 0;
+                 if (content_range_total > 0) {
+                     progress_total = static_cast<size_t>(content_range_total);
+                 } else if (opts.progress_total_hint > 0) {
+                     progress_total = opts.progress_total_hint;
+                 } else if (content_length > 0) {
+                     progress_total = opts.progress_base_bytes + static_cast<size_t>(content_length);
+                 }
+                 size_t transferred_total = opts.progress_base_bytes + static_cast<size_t>(total_read);
 
                  if (opts.progress_callback) {
-                     opts.progress_callback(static_cast<size_t>(total_read), static_cast<size_t>(std::max<long>(0, content_length)), speed);
+                     opts.progress_callback(transferred_total, progress_total, speed);
                  }
 
                  if (opts.show_progress) {
                      int percent = 0;
-                     if (content_length > 0) percent = (int)((total_read * 100) / content_length);
+                     if (progress_total > 0) percent = (int)((transferred_total * 100) / progress_total);
                      if (percent > 100) percent = 100;
 
                      // Bar: [===              ]
@@ -740,9 +780,18 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
          auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
          double speed = 0;
          if (elapsed > 0) speed = (double)total_read * 1000.0 / elapsed;
+         size_t progress_total = 0;
+         if (content_range_total > 0) {
+             progress_total = static_cast<size_t>(content_range_total);
+         } else if (opts.progress_total_hint > 0) {
+             progress_total = opts.progress_total_hint;
+         } else if (content_length > 0) {
+             progress_total = opts.progress_base_bytes + static_cast<size_t>(content_length);
+         }
+         size_t transferred_total = opts.progress_base_bytes + static_cast<size_t>(total_read);
 
          if (opts.progress_callback) {
-             opts.progress_callback(static_cast<size_t>(total_read), static_cast<size_t>(content_length), speed);
+             opts.progress_callback(transferred_total, progress_total, speed);
          }
 
          if (opts.show_progress) {
@@ -889,15 +938,20 @@ bool DownloadFile(
     bool verbose,
     std::string* error_out,
     bool show_progress,
-    std::function<void(size_t, size_t, double)> progress_callback
+    std::function<void(size_t, size_t, double)> progress_callback,
+    size_t* bytes_transferred_out
 ) {
     set_error(error_out, "");
+    if (bytes_transferred_out) *bytes_transferred_out = 0;
 
     // Check if parallel download is suitable
     long size = GetRemoteFileSize(url);
     if (size > 5 * 1024 * 1024 && !show_progress && !progress_callback) { // > 5 MB use parallel when no live UI is attached
         std::string parallel_error;
-        if (DownloadFileParallel(url, dest_path, size, verbose, &parallel_error)) return true;
+        if (DownloadFileParallel(url, dest_path, size, verbose, &parallel_error)) {
+            if (bytes_transferred_out) *bytes_transferred_out = static_cast<size_t>(size);
+            return true;
+        }
         if (verbose) std::cerr << "Parallel download failed, falling back to single connection..." << std::endl;
         set_error(error_out, parallel_error);
     }
@@ -923,10 +977,28 @@ bool DownloadFile(
              sleep(2);
         }
 
-        remove(temp_path.c_str());
+        struct stat partial_stat;
+        size_t resume_offset = 0;
+        if (stat(temp_path.c_str(), &partial_stat) == 0 && partial_stat.st_size > 0) {
+            resume_offset = static_cast<size_t>(partial_stat.st_size);
+        }
 
-        // Always truncate/reset file on each attempt
-        std::ofstream outfile(temp_path, std::ios::binary | std::ios::trunc);
+        HttpOptions attempt_opts = opts;
+        attempt_opts.progress_base_bytes = resume_offset;
+        if (size > 0) {
+            attempt_opts.progress_total_hint = static_cast<size_t>(size);
+        }
+        std::ios::openmode open_mode = std::ios::binary | std::ios::trunc;
+        if (resume_offset > 0) {
+            attempt_opts.resume_from = static_cast<long>(resume_offset);
+            attempt_opts.headers.push_back("Range: bytes=" + std::to_string(resume_offset) + "-");
+            open_mode = std::ios::binary | std::ios::app;
+            if (progress_callback) {
+                progress_callback(resume_offset, attempt_opts.progress_total_hint, 0.0);
+            }
+        }
+
+        std::ofstream outfile(temp_path, open_mode);
         if (!outfile) {
             std::string message = "Could not open output file: " + temp_path;
             std::cerr << "E: " << message << std::endl;
@@ -934,18 +1006,27 @@ bool DownloadFile(
             return false;
         }
 
-        if (HttpRequest(url, outfile, opts, &last_error)) {
+        if (HttpRequest(url, outfile, attempt_opts, &last_error)) {
             outfile.close();
             if (rename(temp_path.c_str(), dest_path.c_str()) != 0) {
                 last_error = std::string("failed to finalize download: ") + strerror(errno);
-                remove(temp_path.c_str());
             } else {
+                if (bytes_transferred_out) {
+                    *bytes_transferred_out = static_cast<size_t>(std::max<long>(0, size));
+                    if (*bytes_transferred_out >= resume_offset) {
+                        *bytes_transferred_out -= resume_offset;
+                    } else {
+                        *bytes_transferred_out = 0;
+                    }
+                }
                 set_error(error_out, "");
                 return true;
             }
         } else {
             outfile.close();
-            remove(temp_path.c_str());
+            if (last_error == "resume request not honored") {
+                remove(temp_path.c_str());
+            }
         }
 
         if (attempts + 1 >= max_attempts) {
@@ -959,7 +1040,6 @@ bool DownloadFile(
         attempts++;
     }
 
-    remove(temp_path.c_str());
     set_error(error_out, last_error);
     return false;
 }
