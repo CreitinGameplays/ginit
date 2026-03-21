@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <arpa/inet.h>
@@ -28,6 +29,7 @@
 #include <atomic>
 #include <cmath>
 #include <numeric>
+#include <unordered_map>
 
 // QEMU Default Network Settings
 #define MY_IP "10.0.2.15"
@@ -274,6 +276,122 @@ void set_error(std::string* error_out, const std::string& message) {
     if (error_out) *error_out = message;
 }
 
+namespace {
+constexpr size_t kTransferBufferSize = 64 * 1024;
+constexpr int kSocketBufferBytes = 1 << 20;
+constexpr long kParallelDownloadThresholdBytes = 5L * 1024L * 1024L;
+
+struct RemoteFileInfo {
+    long content_length = -1;
+    bool accepts_ranges = false;
+};
+
+std::mutex g_remote_file_info_mutex;
+std::unordered_map<std::string, RemoteFileInfo> g_remote_file_info_cache;
+
+long parse_content_length_header(const std::string& headers, const std::string& lower_headers) {
+    size_t pos = lower_headers.find("content-length: ");
+    if (pos == std::string::npos) return -1;
+
+    size_t end = lower_headers.find("\r\n", pos);
+    if (end == std::string::npos) return -1;
+    return std::atol(headers.substr(pos + 16, end - (pos + 16)).c_str());
+}
+
+bool parse_accept_ranges_header(const std::string& lower_headers) {
+    size_t pos = lower_headers.find("accept-ranges: ");
+    if (pos == std::string::npos) return false;
+
+    size_t end = lower_headers.find("\r\n", pos);
+    if (end == std::string::npos) return false;
+    std::string value = trim_copy(lower_headers.substr(pos + 15, end - (pos + 15)));
+    return value.find("bytes") != std::string::npos;
+}
+
+bool probe_remote_file(const std::string& url, RemoteFileInfo* info) {
+    if (!info) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_remote_file_info_mutex);
+        auto it = g_remote_file_info_cache.find(url);
+        if (it != g_remote_file_info_cache.end()) {
+            *info = it->second;
+            return true;
+        }
+    }
+
+    HttpOptions opts;
+    opts.method = "HEAD";
+    opts.include_headers = true;
+    opts.follow_location = true;
+    opts.verbose = false;
+
+    std::stringstream ss;
+    if (!HttpRequest(url, ss, opts)) return false;
+
+    std::string response = ss.str();
+    std::string lower_response = response;
+    std::transform(lower_response.begin(), lower_response.end(), lower_response.begin(), ::tolower);
+
+    RemoteFileInfo parsed;
+    parsed.content_length = parse_content_length_header(response, lower_response);
+    parsed.accepts_ranges = parse_accept_ranges_header(lower_response);
+
+    {
+        std::lock_guard<std::mutex> lock(g_remote_file_info_mutex);
+        g_remote_file_info_cache[url] = parsed;
+    }
+
+    *info = parsed;
+    return true;
+}
+
+void configure_transfer_socket(int sock) {
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &kSocketBufferBytes, sizeof(kSocketBufferBytes));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &kSocketBufferBytes, sizeof(kSocketBufferBytes));
+}
+
+bool write_all(int sock, const char* data, size_t len) {
+    size_t total_written = 0;
+    while (total_written < len) {
+        ssize_t written = write(sock, data + total_written, len - total_written);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (written == 0) return false;
+        total_written += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool ssl_write_all(SSL* ssl, const char* data, size_t len) {
+    size_t total_written = 0;
+    while (total_written < len) {
+        int written = SSL_write(ssl, data + total_written, static_cast<int>(len - total_written));
+        if (written <= 0) {
+            int ssl_err = SSL_get_error(ssl, written);
+            if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) continue;
+            return false;
+        }
+        total_written += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool has_partial_download(const std::string& temp_path) {
+    struct stat st;
+    return stat(temp_path.c_str(), &st) == 0 && st.st_size > 0;
+}
+
+int choose_parallel_thread_count(long content_length) {
+    if (content_length >= 512L * 1024L * 1024L) return 8;
+    if (content_length >= 128L * 1024L * 1024L) return 6;
+    if (content_length >= 32L * 1024L * 1024L) return 4;
+    return 2;
+}
+}
+
 bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const HttpOptions& opts, std::string* error_out);
 
 bool HttpRequest(const std::string& url, std::ostream& out, const HttpOptions& opts, std::string* error_out) {
@@ -443,6 +561,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         set_error(error_out, std::string("socket creation failed: ") + strerror(errno));
         return false;
     }
+    configure_transfer_socket(sock);
 
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
@@ -468,7 +587,11 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         connect_req += "\r\n";
         
         if (opts.verbose) std::cerr << "[NET] Sending Proxy CONNECT..." << std::endl;
-        write(sock, connect_req.c_str(), connect_req.length());
+        if (!write_all(sock, connect_req.c_str(), connect_req.length())) {
+            set_error(error_out, std::string("failed to send proxy CONNECT request: ") + strerror(errno));
+            close(sock);
+            return false;
+        }
         
         char tmp[1024];
         int len = read(sock, tmp, sizeof(tmp)-1);
@@ -491,6 +614,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
             close(sock); return false;
         }
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+        SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS);
 
         ssl = SSL_new(ctx);
         SSL_set_tlsext_host_name(ssl, host.c_str());
@@ -523,14 +647,14 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     if (opts.verbose) std::cerr << "[NET] Sending Request..." << std::endl;
     
     if (use_ssl) {
-        if (SSL_write(ssl, req.c_str(), req.length()) <= 0) {
+        if (!ssl_write_all(ssl, req.c_str(), req.length())) {
             if (opts.verbose) ERR_print_errors_fp(stderr);
             set_error(error_out, "failed to send HTTPS request");
             SSL_free(ssl); SSL_CTX_free(ctx); close(sock);
             return false;
         }
     } else {
-        if (write(sock, req.c_str(), req.length()) < 0) {
+        if (!write_all(sock, req.c_str(), req.length())) {
             if (opts.verbose) perror("[ERR] Write failed");
             set_error(error_out, std::string("failed to send HTTP request: ") + strerror(errno));
             close(sock); return false;
@@ -538,7 +662,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     }
 
     // 8. Read Response
-    char buffer[4096];
+    std::array<char, kTransferBufferSize> buffer;
     int bytes;
     
     long content_length = -1;
@@ -562,9 +686,9 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         }
 
         if (use_ssl) {
-            bytes = SSL_read(ssl, buffer, sizeof(buffer));
+            bytes = SSL_read(ssl, buffer.data(), static_cast<int>(buffer.size()));
         } else {
-            bytes = read(sock, buffer, sizeof(buffer));
+            bytes = read(sock, buffer.data(), buffer.size());
         }
         
         if (bytes <= 0) {
@@ -616,7 +740,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         last_progress = std::chrono::steady_clock::now();
 
         if (!header_parsed && !opts.include_headers) {
-             header_buffer.append(buffer, bytes);
+             header_buffer.append(buffer.data(), bytes);
              size_t header_end = header_buffer.find("\r\n\r\n");
              if (header_end != std::string::npos) {
                  std::string headers = header_buffer.substr(0, header_end);
@@ -718,7 +842,7 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                  header_parsed = true;
              }
         } else {
-             out.write(buffer, bytes);
+             out.write(buffer.data(), bytes);
              total_read += bytes;
         }
         
@@ -823,43 +947,48 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
 
 // Helper to get remote file size
 long GetRemoteFileSize(std::string url) {
-    HttpOptions opts;
-    opts.method = "HEAD";
-    opts.include_headers = true; 
-    opts.verbose = false;
-    
-    std::stringstream ss;
-    if (!HttpRequest(url, ss, opts)) return -1;
-    
-    std::string response = ss.str();
-    
-    // Parse Content-Length
-    std::string lower_resp = response;
-    std::transform(lower_resp.begin(), lower_resp.end(), lower_resp.begin(), ::tolower);
-    size_t pos = lower_resp.find("content-length: ");
-    if (pos != std::string::npos) {
-        size_t end = lower_resp.find("\r\n", pos);
-        if (end != std::string::npos) {
-            std::string val = response.substr(pos + 16, end - (pos + 16));
-            return std::atol(val.c_str());
-        }
-    }
-    return -1;
+    RemoteFileInfo info;
+    if (!probe_remote_file(url, &info)) return -1;
+    return info.content_length;
 }
 
-bool DownloadWorker(std::string url, std::string dest, long start, long end, int id, bool verbose) {
+bool DownloadWorker(
+    std::string url,
+    std::string dest,
+    long start,
+    long end,
+    int id,
+    bool verbose,
+    const std::function<void(size_t, size_t, double)>& progress_callback,
+    std::string* error_out
+) {
     int attempts = 0;
-    while(attempts < 3) {
-        std::ofstream out(dest, std::ios::binary);
-        if (!out) return false;
-        
+    const size_t range_bytes = static_cast<size_t>((end - start) + 1);
+    while (attempts < 3) {
+        std::ofstream out(dest, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            set_error(error_out, "could not open range output " + dest);
+            return false;
+        }
+
         HttpOptions opts;
         opts.verbose = false; // Workers are silent
+        opts.follow_location = true;
+        opts.retry_count = 0;
+        opts.progress_total_hint = range_bytes;
+        opts.progress_callback = progress_callback;
         opts.headers.push_back("Range: bytes=" + std::to_string(start) + "-" + std::to_string(end));
-        
-        if (HttpRequest(url, out, opts)) return true;
-        
+
+        std::string last_error;
+        if (HttpRequest(url, out, opts, &last_error)) return true;
+
+        out.close();
+        remove(dest.c_str());
         attempts++;
+        if (attempts >= 3) {
+            set_error(error_out, last_error.empty() ? "range download failed" : last_error);
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     if (verbose) std::cerr << "[ERR] Worker " << id << " failed after retries." << std::endl;
@@ -870,16 +999,63 @@ void cleanup_download_artifacts(const std::vector<std::string>& paths) {
     for (const auto& path : paths) remove(path.c_str());
 }
 
-bool DownloadFileParallel(std::string url, const std::string& dest_path, long content_length, bool verbose, std::string* error_out) {
-    int num_threads = 4;
+bool DownloadFileParallel(
+    std::string url,
+    const std::string& dest_path,
+    long content_length,
+    bool verbose,
+    std::string* error_out,
+    bool show_progress,
+    const std::function<void(size_t, size_t, double)>& progress_callback,
+    size_t* bytes_transferred_out
+) {
+    int num_threads = choose_parallel_thread_count(content_length);
     long part_size = content_length / num_threads;
     std::string temp_base = dest_path + ".partdownload";
     std::string temp_output = temp_base + ".merged";
+    auto last_update = std::chrono::steady_clock::now();
+    std::mutex progress_mutex;
+    std::vector<size_t> part_progress(static_cast<size_t>(num_threads), 0);
+    std::vector<double> part_speeds(static_cast<size_t>(num_threads), 0.0);
     
     if (verbose) std::cout << "Parallel Download: " << num_threads << " threads, " << (content_length/1024/1024) << " MB" << std::endl;
 
     std::vector<std::future<bool>> futures;
     std::vector<std::string> temp_files;
+    std::vector<std::string> worker_errors(static_cast<size_t>(num_threads));
+
+    auto emit_progress = [&](bool force) {
+        auto now = std::chrono::steady_clock::now();
+        if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count() < 200) {
+            return;
+        }
+
+        size_t transferred = std::accumulate(part_progress.begin(), part_progress.end(), static_cast<size_t>(0));
+        double speed = std::accumulate(part_speeds.begin(), part_speeds.end(), 0.0);
+        size_t total = static_cast<size_t>(std::max<long>(0, content_length));
+
+        if (progress_callback) {
+            progress_callback(transferred, total, speed);
+        }
+
+        if (show_progress) {
+            int percent = 0;
+            if (total > 0) {
+                percent = static_cast<int>((transferred * 100) / total);
+                if (percent > 100) percent = 100;
+            }
+            const int bar_width = 25;
+            int filled = (percent * bar_width) / 100;
+
+            std::cout << "\r[";
+            for (int i = 0; i < bar_width; ++i) {
+                std::cout << (i < filled ? "=" : " ");
+            }
+            std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
+        }
+
+        last_update = now;
+    };
     
     // Start threads
     for(int i=0; i<num_threads; i++) {
@@ -887,8 +1063,25 @@ bool DownloadFileParallel(std::string url, const std::string& dest_path, long co
         long end = (i == num_threads - 1) ? content_length - 1 : (start + part_size - 1);
         std::string temp_file = temp_base + ".part" + std::to_string(i);
         temp_files.push_back(temp_file);
-        
-        futures.push_back(std::async(std::launch::async, DownloadWorker, url, temp_file, start, end, i, verbose));
+
+        futures.push_back(std::async(
+            std::launch::async,
+            DownloadWorker,
+            url,
+            temp_file,
+            start,
+            end,
+            i,
+            verbose,
+            [&, i, start, end](size_t transferred, size_t, double speed) {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                size_t range_bytes = static_cast<size_t>((end - start) + 1);
+                part_progress[static_cast<size_t>(i)] = std::min(transferred, range_bytes);
+                part_speeds[static_cast<size_t>(i)] = speed;
+                emit_progress(false);
+            },
+            &worker_errors[static_cast<size_t>(i)]
+        ));
     }
     
     // Wait for all
@@ -896,6 +1089,18 @@ bool DownloadFileParallel(std::string url, const std::string& dest_path, long co
     for(auto& f : futures) {
         if (!f.get()) success = false;
     }
+    {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        if (success) {
+            for (size_t i = 0; i < part_progress.size(); ++i) {
+                long start = static_cast<long>(i) * part_size;
+                long end = (static_cast<int>(i) == num_threads - 1) ? content_length - 1 : (start + part_size - 1);
+                part_progress[i] = static_cast<size_t>((end - start) + 1);
+            }
+        }
+        emit_progress(true);
+    }
+    if (show_progress) std::cout << std::endl;
     
     if (success) {
         // Merge
@@ -926,8 +1131,17 @@ bool DownloadFileParallel(std::string url, const std::string& dest_path, long co
 
     temp_files.push_back(temp_output);
     cleanup_download_artifacts(temp_files);
+    if (success && bytes_transferred_out) {
+        *bytes_transferred_out = static_cast<size_t>(content_length);
+    }
     if (!success && error_out && error_out->empty()) {
-        set_error(error_out, "parallel download failed");
+        for (const auto& worker_error : worker_errors) {
+            if (!worker_error.empty()) {
+                set_error(error_out, worker_error);
+                break;
+            }
+        }
+        if (error_out->empty()) set_error(error_out, "parallel download failed");
     }
     return success;
 }
@@ -943,13 +1157,29 @@ bool DownloadFile(
 ) {
     set_error(error_out, "");
     if (bytes_transferred_out) *bytes_transferred_out = 0;
+    std::string temp_path = dest_path + ".part";
 
-    // Check if parallel download is suitable
-    long size = GetRemoteFileSize(url);
-    if (size > 5 * 1024 * 1024 && !show_progress && !progress_callback) { // > 5 MB use parallel when no live UI is attached
+    RemoteFileInfo remote_info;
+    long size = -1;
+    bool have_remote_info = probe_remote_file(url, &remote_info);
+    if (have_remote_info) size = remote_info.content_length;
+
+    // Use multi-part downloads only for fresh transfers when the server confirms byte ranges.
+    if (!has_partial_download(temp_path) &&
+        have_remote_info &&
+        remote_info.content_length > kParallelDownloadThresholdBytes &&
+        remote_info.accepts_ranges) {
         std::string parallel_error;
-        if (DownloadFileParallel(url, dest_path, size, verbose, &parallel_error)) {
-            if (bytes_transferred_out) *bytes_transferred_out = static_cast<size_t>(size);
+        if (DownloadFileParallel(
+                url,
+                dest_path,
+                remote_info.content_length,
+                verbose,
+                &parallel_error,
+                show_progress && !verbose,
+                progress_callback,
+                bytes_transferred_out
+            )) {
             return true;
         }
         if (verbose) std::cerr << "Parallel download failed, falling back to single connection..." << std::endl;
@@ -966,7 +1196,6 @@ bool DownloadFile(
     // Robust Retry Loop (Manual)
     int attempts = 0;
     int max_attempts = 5; // Increased default retries
-    std::string temp_path = dest_path + ".part";
     std::string last_error;
     
     while (attempts < max_attempts) {
