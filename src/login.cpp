@@ -18,6 +18,13 @@
 
 namespace {
 
+void set_default_env(const char* name, const std::string& value) {
+    const char* current = getenv(name);
+    if (!current || *current == '\0') {
+        setenv(name, value.c_str(), 1);
+    }
+}
+
 std::string prompt_input(const std::string& prompt, bool echo) {
     if (!prompt.empty()) {
         std::cout << prompt;
@@ -113,12 +120,21 @@ int conversation(int num_msg, const pam_message** msg, pam_response** resp, void
 }
 
 void set_base_environment(const passwd& user) {
+    const std::string home = (user.pw_dir && *user.pw_dir) ? user.pw_dir : "/";
+
     setenv("USER", user.pw_name, 1);
     setenv("LOGNAME", user.pw_name, 1);
-    setenv("HOME", user.pw_dir, 1);
+    setenv("HOME", home.c_str(), 1);
     setenv("SHELL", (user.pw_shell && *user.pw_shell) ? user.pw_shell : "/bin/bash", 1);
     setenv("PATH", "/bin/apps/system:/bin/apps:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin", 1);
-    setenv("TERM", "linux", 0);
+    set_default_env("TERM", "linux");
+    set_default_env("XDG_CONFIG_DIRS", "/etc/xdg");
+    set_default_env("XDG_DATA_DIRS", "/usr/local/share:/usr/share");
+    set_default_env("XDG_CONFIG_HOME", home + "/.config");
+    set_default_env("XDG_CACHE_HOME", home + "/.cache");
+    set_default_env("XDG_DATA_HOME", home + "/.local/share");
+    set_default_env("XDG_STATE_HOME", home + "/.local/state");
+    set_default_env("XDG_SESSION_CLASS", "user");
 }
 
 void import_pam_environment(pam_handle_t* pamh) {
@@ -153,12 +169,76 @@ void ensure_runtime_dir(const passwd& user) {
     setenv("XDG_RUNTIME_DIR", runtime_dir.c_str(), 1);
 }
 
+void ensure_directory_path(const std::string& path) {
+    if (path.empty()) {
+        return;
+    }
+
+    std::string current;
+    if (path.front() == '/') {
+        current = "/";
+    }
+
+    size_t index = current == "/" ? 1 : 0;
+    while (index <= path.size()) {
+        size_t next_sep = path.find('/', index);
+        std::string component = path.substr(index, next_sep == std::string::npos ? std::string::npos : next_sep - index);
+        if (!component.empty()) {
+            if (current.size() > 1 && current.back() != '/') {
+                current += "/";
+            }
+            current += component;
+            if (mkdir(current.c_str(), 0700) != 0 && errno != EEXIST) {
+                perror(("mkdir " + current).c_str());
+                return;
+            }
+        }
+        if (next_sep == std::string::npos) {
+            break;
+        }
+        index = next_sep + 1;
+    }
+}
+
+void ensure_user_xdg_dirs() {
+    const char* directories[] = {
+        getenv("XDG_CONFIG_HOME"),
+        getenv("XDG_CACHE_HOME"),
+        getenv("XDG_DATA_HOME"),
+        getenv("XDG_STATE_HOME"),
+    };
+
+    for (const char* path : directories) {
+        if (path && *path) {
+            ensure_directory_path(path);
+        }
+    }
+}
+
+void adopt_runtime_dbus_address() {
+    const char* runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (!runtime_dir || *runtime_dir == '\0') {
+        return;
+    }
+    if (getenv("DBUS_SESSION_BUS_ADDRESS") != nullptr) {
+        return;
+    }
+
+    const std::string bus_path = std::string(runtime_dir) + "/bus";
+    struct stat st {};
+    if (stat(bus_path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode)) {
+        setenv("DBUS_SESSION_BUS_ADDRESS", ("unix:path=" + bus_path).c_str(), 1);
+    }
+}
+
 void prepare_user_session(const passwd& user, pam_handle_t* pamh) {
     set_base_environment(user);
     import_pam_environment(pamh);
     if (getenv("XDG_RUNTIME_DIR") == nullptr || access(getenv("XDG_RUNTIME_DIR"), F_OK) != 0) {
         ensure_runtime_dir(user);
     }
+    ensure_user_xdg_dirs();
+    adopt_runtime_dbus_address();
 }
 
 int run_shell_session(const passwd& user, pam_handle_t* pamh) {
