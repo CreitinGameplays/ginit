@@ -284,18 +284,51 @@ constexpr long kParallelDownloadThresholdBytes = 5L * 1024L * 1024L;
 struct RemoteFileInfo {
     long content_length = -1;
     bool accepts_ranges = false;
+    std::string etag;
+    std::string last_modified;
 };
 
 std::mutex g_remote_file_info_mutex;
 std::unordered_map<std::string, RemoteFileInfo> g_remote_file_info_cache;
 
-long parse_content_length_header(const std::string& headers, const std::string& lower_headers) {
-    size_t pos = lower_headers.find("content-length: ");
-    if (pos == std::string::npos) return -1;
+std::string lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    return value;
+}
 
-    size_t end = lower_headers.find("\r\n", pos);
-    if (end == std::string::npos) return -1;
-    return std::atol(headers.substr(pos + 16, end - (pos + 16)).c_str());
+int parse_http_status_code(const std::string& headers) {
+    size_t first_line_end = headers.find("\r\n");
+    std::string status_line = first_line_end == std::string::npos
+        ? headers
+        : headers.substr(0, first_line_end);
+
+    size_t first_space = status_line.find(' ');
+    if (first_space == std::string::npos) return 0;
+    size_t code_start = status_line.find_first_not_of(' ', first_space);
+    if (code_start == std::string::npos) return 0;
+    size_t code_end = status_line.find_first_not_of("0123456789", code_start);
+    std::string code_text = status_line.substr(code_start, code_end - code_start);
+    return std::atoi(code_text.c_str());
+}
+
+std::string parse_header_value(
+    const std::string& headers,
+    const std::string& lower_headers,
+    const std::string& header_name
+) {
+    size_t pos = lower_headers.find(header_name);
+    if (pos == std::string::npos) return "";
+
+    size_t start = pos + header_name.size();
+    size_t end = lower_headers.find("\r\n", start);
+    if (end == std::string::npos) return "";
+    return trim_copy(headers.substr(start, end - start));
+}
+
+long parse_content_length_header(const std::string& headers, const std::string& lower_headers) {
+    std::string value = parse_header_value(headers, lower_headers, "content-length: ");
+    if (value.empty()) return -1;
+    return std::atol(value.c_str());
 }
 
 bool parse_accept_ranges_header(const std::string& lower_headers) {
@@ -330,12 +363,16 @@ bool probe_remote_file(const std::string& url, RemoteFileInfo* info) {
     if (!HttpRequest(url, ss, opts)) return false;
 
     std::string response = ss.str();
-    std::string lower_response = response;
-    std::transform(lower_response.begin(), lower_response.end(), lower_response.begin(), ::tolower);
+    std::string lower_response = lower_copy(response);
+
+    int status_code = parse_http_status_code(response);
+    if (status_code < 200 || status_code >= 300) return false;
 
     RemoteFileInfo parsed;
     parsed.content_length = parse_content_length_header(response, lower_response);
     parsed.accepts_ranges = parse_accept_ranges_header(lower_response);
+    parsed.etag = parse_header_value(response, lower_response, "etag: ");
+    parsed.last_modified = parse_header_value(response, lower_response, "last-modified: ");
 
     {
         std::lock_guard<std::mutex> lock(g_remote_file_info_mutex);
@@ -739,111 +776,105 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
 
         last_progress = std::chrono::steady_clock::now();
 
-        if (!header_parsed && !opts.include_headers) {
-             header_buffer.append(buffer.data(), bytes);
-             size_t header_end = header_buffer.find("\r\n\r\n");
-             if (header_end != std::string::npos) {
-                 std::string headers = header_buffer.substr(0, header_end);
-                 std::string lower_headers = headers;
-                 std::transform(lower_headers.begin(), lower_headers.end(), lower_headers.begin(), ::tolower);
+        if (!header_parsed) {
+            header_buffer.append(buffer.data(), bytes);
+            size_t header_end = header_buffer.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                std::string headers = header_buffer.substr(0, header_end);
+                std::string lower_headers = lower_copy(headers);
 
-                 // Check HTTP Status
-                 size_t first_line_end = headers.find("\r\n");
-                 if (first_line_end != std::string::npos) {
-                     std::string status_line = headers.substr(0, first_line_end);
-                     bool is_redirect = status_line.find(" 302 ") != std::string::npos ||
-                                        status_line.find(" 301 ") != std::string::npos;
-                     bool is_partial = status_line.find(" 206 ") != std::string::npos;
-                     bool is_ok = status_line.find(" 200 ") != std::string::npos ||
-                                  status_line.find(" 201 ") != std::string::npos ||
-                                  is_partial;
-                     if (is_redirect) {
-                         if (!opts.follow_location) {
-                             if (opts.verbose) std::cerr << "[ERR] Redirect received but redirect following is disabled: " << status_line << std::endl;
-                             set_error(error_out, "redirect received but follow_location is disabled");
-                             if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                             close(sock);
-                             return false;
-                         }
+                int status_code = parse_http_status_code(headers);
+                size_t first_line_end = headers.find("\r\n");
+                std::string status_line = first_line_end == std::string::npos
+                    ? headers
+                    : headers.substr(0, first_line_end);
+                bool is_redirect = status_code == 301 || status_code == 302 ||
+                                   status_code == 303 || status_code == 307 ||
+                                   status_code == 308;
+                bool is_partial = status_code == 206;
+                bool is_ok = status_code == 200 || status_code == 201 || is_partial;
 
-                         size_t loc_pos = lower_headers.find("location: ");
-                         if (loc_pos == std::string::npos) {
-                             if (opts.verbose) std::cerr << "[ERR] Redirect response missing Location header." << std::endl;
-                             set_error(error_out, "redirect response missing Location header");
-                             if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                             close(sock);
-                             return false;
-                         }
+                if (is_redirect) {
+                    if (!opts.follow_location) {
+                        if (opts.verbose) std::cerr << "[ERR] Redirect received but redirect following is disabled: " << status_line << std::endl;
+                        set_error(error_out, "redirect received but follow_location is disabled");
+                        if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                        close(sock);
+                        return false;
+                    }
 
-                         size_t loc_start = loc_pos + 10;
-                         size_t loc_end = lower_headers.find("\r\n", loc_start);
-                         std::string redirect_url = trim_copy(headers.substr(loc_start, loc_end - loc_start));
-                         if (!redirect_url.empty() && redirect_url[0] == '/') {
-                             redirect_url = protocol + "://" + host + redirect_url;
-                         }
+                    std::string redirect_url = parse_header_value(headers, lower_headers, "location: ");
+                    if (redirect_url.empty()) {
+                        if (opts.verbose) std::cerr << "[ERR] Redirect response missing Location header." << std::endl;
+                        set_error(error_out, "redirect response missing Location header");
+                        if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                        close(sock);
+                        return false;
+                    }
+                    if (redirect_url[0] == '/') {
+                        redirect_url = protocol + "://" + host + redirect_url;
+                    }
 
-                         if (opts.verbose) std::cerr << "[NET] Following redirect to " << redirect_url << std::endl;
-                         if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                         close(sock);
+                    if (opts.verbose) std::cerr << "[NET] Following redirect to " << redirect_url << std::endl;
+                    if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                    close(sock);
 
-                         HttpOptions redirect_opts = opts;
-                         redirect_opts.max_redirects = opts.max_redirects - 1;
-                         return HttpRequestInternal(redirect_url, out, redirect_opts, error_out);
-                     }
+                    HttpOptions redirect_opts = opts;
+                    redirect_opts.max_redirects = opts.max_redirects - 1;
+                    return HttpRequestInternal(redirect_url, out, redirect_opts, error_out);
+                }
 
-                     if (!is_ok) {
-                         if (opts.verbose) std::cerr << "[ERR] HTTP Status Error: " << status_line << std::endl;
-                         set_error(error_out, "HTTP status error: " + status_line);
-                         if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                         close(sock);
-                         return false; 
-                     }
+                if (!is_ok) {
+                    if (opts.verbose) std::cerr << "[ERR] HTTP Status Error: " << status_line << std::endl;
+                    set_error(error_out, "HTTP status error: " + status_line);
+                    if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                    close(sock);
+                    return false;
+                }
 
-                     if (opts.resume_from > 0 && !is_partial) {
-                         if (opts.verbose) {
-                             std::cerr << "[ERR] Resume request was not honored by server: "
-                                       << status_line << std::endl;
-                         }
-                         set_error(error_out, "resume request not honored");
-                         if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                         close(sock);
-                         return false;
-                     }
-                 }
-                 
-                 // Look for Content-Length
-                 size_t cl_pos = lower_headers.find("content-length: ");
-                 if (cl_pos != std::string::npos) {
-                     size_t val_start = cl_pos + 16;
-                     size_t val_end = lower_headers.find("\r\n", val_start);
-                     if (val_end != std::string::npos) {
-                         content_length = std::atol(headers.substr(val_start, val_end - val_start).c_str());
-                     }
-                 }
+                if (opts.resume_from > 0 && !is_partial) {
+                    if (opts.verbose) {
+                        std::cerr << "[ERR] Resume request was not honored by server: "
+                                  << status_line << std::endl;
+                    }
+                    set_error(error_out, "resume request not honored");
+                    if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+                    close(sock);
+                    return false;
+                }
 
-                 size_t cr_pos = lower_headers.find("content-range: ");
-                 if (cr_pos != std::string::npos) {
-                     size_t val_start = cr_pos + 15;
-                     size_t val_end = lower_headers.find("\r\n", val_start);
-                     if (val_end != std::string::npos) {
-                         std::string range_value = trim_copy(headers.substr(val_start, val_end - val_start));
-                         size_t slash_pos = range_value.rfind('/');
-                         if (slash_pos != std::string::npos) {
-                             std::string total_str = trim_copy(range_value.substr(slash_pos + 1));
-                             if (!total_str.empty() && total_str != "*") {
-                                 content_range_total = std::atol(total_str.c_str());
-                             }
-                         }
-                     }
-                 }
-                 
-                 out.write(header_buffer.c_str() + header_end + 4, header_buffer.length() - (header_end + 4));
-                 total_read += (header_buffer.length() - (header_end + 4));
-                 header_parsed = true;
-             }
+                content_length = parse_content_length_header(headers, lower_headers);
+
+                size_t cr_pos = lower_headers.find("content-range: ");
+                if (cr_pos != std::string::npos) {
+                    size_t val_start = cr_pos + 15;
+                    size_t val_end = lower_headers.find("\r\n", val_start);
+                    if (val_end != std::string::npos) {
+                        std::string range_value = trim_copy(headers.substr(val_start, val_end - val_start));
+                        size_t slash_pos = range_value.rfind('/');
+                        if (slash_pos != std::string::npos) {
+                            std::string total_str = trim_copy(range_value.substr(slash_pos + 1));
+                            if (!total_str.empty() && total_str != "*") {
+                                content_range_total = std::atol(total_str.c_str());
+                            }
+                        }
+                    }
+                }
+
+                if (opts.include_headers) {
+                    out.write(header_buffer.c_str(), header_end + 4);
+                }
+
+                size_t body_offset = header_end + 4;
+                if (header_buffer.length() > body_offset) {
+                    out.write(header_buffer.c_str() + body_offset, header_buffer.length() - body_offset);
+                    total_read += (header_buffer.length() - body_offset);
+                }
+                header_parsed = true;
+            }
         } else {
-             out.write(buffer.data(), bytes);
-             total_read += bytes;
+            out.write(buffer.data(), bytes);
+            total_read += bytes;
         }
         
         if ((opts.show_progress || opts.progress_callback) && header_parsed) {

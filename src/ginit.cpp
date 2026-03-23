@@ -28,6 +28,57 @@
 
 ginit::GServiceManager service_manager;
 
+std::string trim_copy_local(const std::string& value) {
+    size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::string unquote_os_release_value(std::string value) {
+    value = trim_copy_local(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+std::map<std::string, std::string> load_os_release_fields(const std::string& path = "/etc/os-release") {
+    std::map<std::string, std::string> fields;
+    std::ifstream file(path);
+    if (!file) return fields;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        line = trim_copy_local(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim_copy_local(line.substr(0, eq));
+        std::string value = unquote_os_release_value(line.substr(eq + 1));
+        if (!key.empty()) fields[key] = value;
+    }
+
+    return fields;
+}
+
+std::string release_field_or(
+    const std::map<std::string, std::string>& fields,
+    const std::string& key,
+    const std::string& fallback
+) {
+    auto it = fields.find(key);
+    if (it == fields.end() || trim_copy_local(it->second).empty()) return fallback;
+    return it->second;
+}
+
+std::string runtime_pretty_name() {
+    auto fields = load_os_release_fields();
+    return release_field_or(fields, "PRETTY_NAME", std::string(OS_NAME) + " " + OS_VERSION);
+}
+
 // Mount filesystems and ensure target directory exists
 void mount_fs(const char* source, const char* target, const char* fs_type) {
     mkdir(target, 0755);
@@ -73,29 +124,48 @@ void ensure_fhs() {
 
 // Generate system information files for other applications (like neofetch, gemfetch)
 void generate_os_release() {
-    std::ofstream f("/etc/os-release");
-    if (f) {
-        f << "NAME=\"" << OS_NAME << "\"\n";
-        f << "VERSION=\"" << OS_VERSION << " (" << OS_CODENAME << ")\"\n";
-        f << "ID=" << OS_ID << "\n";
-        f << "ID_LIKE=" << OS_ID_LIKE << "\n";
-        f << "PRETTY_NAME=\"" << OS_NAME << " " << OS_VERSION << " (" << OS_CODENAME << ")\"\n";
-        f << "VERSION_ID=\"" << OS_VERSION << "\"\n";
-        f << "VERSION_CODENAME=" << OS_CODENAME << "\n";
-        f << "ANSI_COLOR=\"" << OS_ANSI_COLOR << "\"\n";
-        f << "HOME_URL=\"https://github.com/CreitinGameplays/geminios\"\n";
-        f << "SUPPORT_URL=\"https://github.com/CreitinGameplays/geminios/issues\"\n";
-        f << "BUG_REPORT_URL=\"https://github.com/CreitinGameplays/geminios/issues\"\n";
-        f.close();
-        std::cout << "[GINIT] Generated /etc/os-release" << std::endl;
+    auto release = load_os_release_fields();
+    if (release.empty()) {
+        release["NAME"] = OS_NAME;
+        release["VERSION"] = OS_VERSION;
+        release["ID"] = OS_ID;
+        release["ID_LIKE"] = OS_ID_LIKE;
+        release["PRETTY_NAME"] = std::string(OS_NAME) + " " + OS_VERSION;
+        release["VERSION_ID"] = OS_VERSION_ID;
+        release["VERSION_CODENAME"] = OS_CODENAME;
+        release["ANSI_COLOR"] = OS_ANSI_COLOR;
+        release["HOME_URL"] = "https://github.com/CreitinGameplays/geminios";
+        release["SUPPORT_URL"] = "https://github.com/CreitinGameplays/geminios/issues";
+        release["BUG_REPORT_URL"] = "https://github.com/CreitinGameplays/geminios/issues";
+
+        std::ofstream f("/etc/os-release");
+        if (f) {
+            f << "NAME=\"" << release["NAME"] << "\"\n";
+            f << "VERSION=\"" << release["VERSION"] << "\"\n";
+            f << "ID=" << release["ID"] << "\n";
+            f << "ID_LIKE=\"" << release["ID_LIKE"] << "\"\n";
+            f << "PRETTY_NAME=\"" << release["PRETTY_NAME"] << "\"\n";
+            f << "VERSION_ID=\"" << release["VERSION_ID"] << "\"\n";
+            f << "VERSION_CODENAME=\"" << release["VERSION_CODENAME"] << "\"\n";
+            f << "ANSI_COLOR=\"" << release["ANSI_COLOR"] << "\"\n";
+            f << "HOME_URL=\"" << release["HOME_URL"] << "\"\n";
+            f << "SUPPORT_URL=\"" << release["SUPPORT_URL"] << "\"\n";
+            f << "BUG_REPORT_URL=\"" << release["BUG_REPORT_URL"] << "\"\n";
+            f.close();
+            std::cout << "[GINIT] Generated fallback /etc/os-release" << std::endl;
+        }
     }
+
+    std::string pretty_name = release_field_or(release, "PRETTY_NAME", std::string(OS_NAME) + " " + OS_VERSION);
+    std::string version_id = release_field_or(release, "VERSION_ID", OS_VERSION_ID);
+    std::string codename = release_field_or(release, "VERSION_CODENAME", OS_CODENAME);
 
     std::ofstream lsb("/etc/lsb-release");
     if (lsb) {
-        lsb << "DISTRIB_ID=" << OS_NAME << "\n";
-        lsb << "DISTRIB_RELEASE=" << OS_VERSION << "\n";
-        lsb << "DISTRIB_CODENAME=" << OS_CODENAME << "\n";
-        lsb << "DISTRIB_DESCRIPTION=\"" << OS_NAME << " " << OS_VERSION << " (" << OS_CODENAME << ")\"\n";
+        lsb << "DISTRIB_ID=" << release_field_or(release, "NAME", OS_NAME) << "\n";
+        lsb << "DISTRIB_RELEASE=" << version_id << "\n";
+        lsb << "DISTRIB_CODENAME=" << codename << "\n";
+        lsb << "DISTRIB_DESCRIPTION=\"" << pretty_name << "\"\n";
         lsb.close();
         std::cout << "[GINIT] Generated /etc/lsb-release" << std::endl;
     }
@@ -116,7 +186,7 @@ void generate_os_release() {
 
     std::ofstream issue("/etc/issue");
     if (issue) {
-        issue << OS_NAME << " " << OS_VERSION << " (" << OS_CODENAME << ")\n\\l\n\n";
+        issue << pretty_name << "\n\\l\n\n";
         issue.close();
     }
 }
@@ -212,8 +282,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "\033[2J\033[1;1H"; 
-    std::cout << "Welcome to " << OS_NAME << " " << OS_VERSION << std::endl;     
+    std::cout << "\033[2J\033[1;1H";
+    std::cout << "Welcome to " << runtime_pretty_name() << std::endl;
     
 mount_fs("none", "/proc", "proc");
 mount_fs("none", "/sys", "sysfs");
