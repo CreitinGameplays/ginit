@@ -10,6 +10,7 @@
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <dirent.h>
+#include <cctype>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -27,6 +28,8 @@
 #include "gservice_manager.hpp"
 
 ginit::GServiceManager service_manager;
+
+void safe_mkdir(const char* dir);
 
 std::string trim_copy_local(const std::string& value) {
     size_t first = value.find_first_not_of(" \t\r\n");
@@ -79,6 +82,154 @@ std::string runtime_pretty_name() {
     return release_field_or(fields, "PRETTY_NAME", std::string(OS_NAME) + " " + OS_VERSION);
 }
 
+std::string to_lower_copy_local(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::string find_first_existing_path(const std::vector<std::string>& candidates) {
+    for (const auto& candidate : candidates) {
+        if (!candidate.empty() && access(candidate.c_str(), F_OK) == 0) {
+            return candidate;
+        }
+    }
+    return "";
+}
+
+int run_helper_command(const std::string& path, const std::vector<std::string>& args) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror(("[GINIT] fork failed for " + path).c_str());
+        return -1;
+    }
+
+    if (pid == 0) {
+        std::vector<char*> exec_args;
+        exec_args.reserve(args.size() + 2);
+        exec_args.push_back(const_cast<char*>(path.c_str()));
+        for (const auto& arg : args) {
+            exec_args.push_back(const_cast<char*>(arg.c_str()));
+        }
+        exec_args.push_back(nullptr);
+        execv(path.c_str(), exec_args.data());
+        perror(("[GINIT] exec failed for " + path).c_str());
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror(("[GINIT] waitpid failed for " + path).c_str());
+        return -1;
+    }
+
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return -1;
+}
+
+void configure_selinux_runtime() {
+    auto config = load_os_release_fields("/etc/selinux/config");
+    std::string mode = to_lower_copy_local(release_field_or(config, "SELINUX", "disabled"));
+    std::string policy_name = trim_copy_local(release_field_or(config, "SELINUXTYPE", "default"));
+
+    if (mode == "disabled") {
+        return;
+    }
+
+    safe_mkdir("/sys/fs");
+    safe_mkdir("/sys/fs/selinux");
+
+    if (mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, nullptr) != 0 && errno != EBUSY) {
+        perror("[GINIT] Failed to mount /sys/fs/selinux");
+        return;
+    }
+
+    const bool is_live = access("/etc/geminios-live", F_OK) == 0;
+    const bool want_permissive = is_live || mode == "permissive";
+
+    const std::string load_policy = find_first_existing_path({
+        "/usr/sbin/load_policy",
+        "/sbin/load_policy",
+    });
+    if (!load_policy.empty()) {
+        int rc = run_helper_command(load_policy, {});
+        if (rc != 0) {
+            std::cerr << "[GINIT] SELinux policy load failed with exit code " << rc << std::endl;
+        }
+    } else {
+        std::cerr << "[GINIT] SELinux requested but load_policy is not installed." << std::endl;
+    }
+
+    if (want_permissive) {
+        const std::string setenforce = find_first_existing_path({
+            "/usr/sbin/setenforce",
+            "/sbin/setenforce",
+        });
+        if (!setenforce.empty()) {
+            int rc = run_helper_command(setenforce, {"0"});
+            if (rc != 0) {
+                std::cerr << "[GINIT] Failed to switch SELinux to permissive mode (exit " << rc << ")." << std::endl;
+            }
+        }
+    }
+
+    const std::string file_contexts = find_first_existing_path({
+        "/etc/selinux/" + policy_name + "/contexts/files/file_contexts",
+        "/etc/selinux/default/contexts/files/file_contexts",
+        "/etc/selinux/targeted/contexts/files/file_contexts",
+    });
+    const std::vector<std::string> relabel_paths = {
+        "/bin", "/boot", "/etc", "/home", "/lib", "/lib64",
+        "/opt", "/root", "/sbin", "/srv", "/usr", "/var"
+    };
+
+    if (access("/.autorelabel", F_OK) == 0 && !file_contexts.empty()) {
+        const std::string setfiles = find_first_existing_path({
+            "/usr/sbin/setfiles",
+            "/sbin/setfiles",
+        });
+        if (!setfiles.empty()) {
+            std::vector<std::string> args = {"-F", file_contexts};
+            for (const auto& path : relabel_paths) {
+                if (access(path.c_str(), F_OK) == 0) args.push_back(path);
+            }
+
+            int rc = run_helper_command(setfiles, args);
+            if (rc == 0) {
+                unlink("/.autorelabel");
+                std::cout << "[GINIT] Completed SELinux relabel pass." << std::endl;
+            } else {
+                std::cerr << "[GINIT] SELinux relabel pass failed with exit code " << rc << std::endl;
+            }
+        }
+    }
+
+    const std::string restorecon = find_first_existing_path({
+        "/usr/sbin/restorecon",
+        "/sbin/restorecon",
+    });
+    if (!restorecon.empty()) {
+        std::vector<std::string> args = {
+            "-RF",
+            "/dev",
+            "/run",
+            "/tmp",
+            "/var/log",
+            "/var/tmp",
+            "/var/lib",
+            "/home",
+            "/root",
+            "/etc",
+        };
+        int rc = run_helper_command(restorecon, args);
+        if (rc != 0) {
+            std::cerr << "[GINIT] restorecon failed with exit code " << rc << std::endl;
+        }
+    }
+}
+
 // Mount filesystems and ensure target directory exists
 void mount_fs(const char* source, const char* target, const char* fs_type) {
     mkdir(target, 0755);
@@ -108,6 +259,7 @@ void ensure_fhs() {
         "/mnt", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", 
         "/sys", "/tmp", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/locale", "/usr/lib/gconv", "/usr/local", 
         "/usr/share", "/var", "/var/lib", "/var/log", "/var/tmp", "/var/repo",
+        "/sys/fs", "/sys/fs/selinux",
         "/run/lock", "/run/user", "/run/systemd", "/run/systemd/inhibit", "/run/systemd/seats",
         "/run/systemd/sessions", "/run/systemd/users", "/var/lib/elogind",
         "/usr/share/X11", "/usr/share/X11/xkb", "/usr/share/X11/xkb/compiled"
@@ -322,6 +474,8 @@ safe_mkdir("/run/systemd/sessions");
 safe_mkdir("/run/systemd/users");
 safe_mkdir("/run/user");
 safe_mkdir("/var/lib/elogind");
+
+configure_selinux_runtime();
 
 // Copy default services to system directory if not present
 // This is a bit of a hack for first boot, but okay for now.
