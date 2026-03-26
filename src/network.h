@@ -12,6 +12,7 @@ struct HttpOptions {
     bool include_headers = false;
     bool head_only = false;
     bool follow_location = false;
+    bool allow_connection_reuse = false;
     bool insecure = true;
     int max_redirects = 5;
     int timeout = 30;
@@ -51,7 +52,8 @@ bool DownloadFile(
     std::string* error_out = nullptr,
     bool show_progress = true,
     std::function<void(size_t, size_t, double)> progress_callback = nullptr,
-    size_t* bytes_transferred_out = nullptr
+    size_t* bytes_transferred_out = nullptr,
+    long known_remote_size = -1
 );
 
 #endif // NETWORK_H

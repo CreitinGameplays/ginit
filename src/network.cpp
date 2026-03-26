@@ -288,8 +288,41 @@ struct RemoteFileInfo {
     std::string last_modified;
 };
 
+struct PersistentHttpConnection {
+    int sock = -1;
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+};
+
+void close_persistent_http_connection(PersistentHttpConnection& conn) {
+    if (conn.ssl) {
+        SSL_shutdown(conn.ssl);
+        SSL_free(conn.ssl);
+        conn.ssl = nullptr;
+    }
+    if (conn.ctx) {
+        SSL_CTX_free(conn.ctx);
+        conn.ctx = nullptr;
+    }
+    if (conn.sock >= 0) {
+        close(conn.sock);
+        conn.sock = -1;
+    }
+}
+
+struct PersistentHttpConnectionPool {
+    std::unordered_map<std::string, PersistentHttpConnection> connections;
+
+    ~PersistentHttpConnectionPool() {
+        for (auto& entry : connections) {
+            close_persistent_http_connection(entry.second);
+        }
+    }
+};
+
 std::mutex g_remote_file_info_mutex;
 std::unordered_map<std::string, RemoteFileInfo> g_remote_file_info_cache;
+thread_local PersistentHttpConnectionPool g_persistent_http_connection_pool;
 
 std::string lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), ::tolower);
@@ -321,7 +354,7 @@ std::string parse_header_value(
 
     size_t start = pos + header_name.size();
     size_t end = lower_headers.find("\r\n", start);
-    if (end == std::string::npos) return "";
+    if (end == std::string::npos) end = lower_headers.size();
     return trim_copy(headers.substr(start, end - start));
 }
 
@@ -336,7 +369,7 @@ bool parse_accept_ranges_header(const std::string& lower_headers) {
     if (pos == std::string::npos) return false;
 
     size_t end = lower_headers.find("\r\n", pos);
-    if (end == std::string::npos) return false;
+    if (end == std::string::npos) end = lower_headers.size();
     std::string value = trim_copy(lower_headers.substr(pos + 15, end - (pos + 15)));
     return value.find("bytes") != std::string::npos;
 }
@@ -357,6 +390,7 @@ bool probe_remote_file(const std::string& url, RemoteFileInfo* info) {
     opts.method = "HEAD";
     opts.include_headers = true;
     opts.follow_location = true;
+    opts.allow_connection_reuse = true;
     opts.verbose = false;
 
     std::stringstream ss;
@@ -427,6 +461,128 @@ int choose_parallel_thread_count(long content_length) {
     if (content_length >= 32L * 1024L * 1024L) return 4;
     return 2;
 }
+
+std::string build_http_connection_pool_key(
+    bool use_ssl,
+    const std::string& host,
+    int port,
+    const std::string& connect_host,
+    int connect_port,
+    const std::string& proxy,
+    const std::string& auth
+) {
+    std::ostringstream out;
+    out << (use_ssl ? "https" : "http")
+        << "|" << host << ":" << port
+        << "|" << connect_host << ":" << connect_port
+        << "|" << proxy
+        << "|" << auth;
+    return out.str();
+}
+
+bool open_http_transport_connection(
+    const std::string& connect_host,
+    int connect_port,
+    const std::string& host,
+    int port,
+    bool use_ssl,
+    const std::string& proxy_str,
+    const std::string& proxy_auth_header,
+    bool verbose,
+    PersistentHttpConnection& conn,
+    std::string* error_out
+) {
+    close_persistent_http_connection(conn);
+
+    std::string ip = ResolveDNS(connect_host);
+    if (ip.empty()) {
+        if (verbose) std::cerr << "[ERR] Could not resolve: " << connect_host << std::endl;
+        set_error(error_out, "could not resolve " + connect_host);
+        return false;
+    }
+    if (verbose) std::cerr << "[NET] Connecting to IP: " << ip << std::endl;
+
+    if (g_stop_sig) {
+        set_error(error_out, "interrupted by signal");
+        return false;
+    }
+
+    conn.sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (conn.sock < 0) {
+        if (verbose) perror("[ERR] Socket creation failed");
+        set_error(error_out, std::string("socket creation failed: ") + strerror(errno));
+        return false;
+    }
+    configure_transfer_socket(conn.sock);
+
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(connect_port);
+    inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr);
+
+    if (connect(conn.sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        if (verbose) perror("[ERR] Connection failed");
+        set_error(error_out, std::string("connection failed: ") + strerror(errno));
+        close_persistent_http_connection(conn);
+        return false;
+    }
+
+    if (!proxy_str.empty() && use_ssl) {
+        std::string connect_req = "CONNECT " + host + ":" + std::to_string(port) + " HTTP/1.1\r\n";
+        connect_req += "Host: " + host + ":" + std::to_string(port) + "\r\n";
+        connect_req += proxy_auth_header;
+        connect_req += "\r\n";
+
+        if (verbose) std::cerr << "[NET] Sending Proxy CONNECT..." << std::endl;
+        if (!write_all(conn.sock, connect_req.c_str(), connect_req.length())) {
+            set_error(error_out, std::string("failed to send proxy CONNECT request: ") + strerror(errno));
+            close_persistent_http_connection(conn);
+            return false;
+        }
+
+        char tmp[1024];
+        int len = read(conn.sock, tmp, sizeof(tmp) - 1);
+        if (len <= 0) {
+            set_error(error_out, "proxy CONNECT failed");
+            close_persistent_http_connection(conn);
+            return false;
+        }
+        tmp[len] = 0;
+        if (std::string(tmp).find("200") == std::string::npos) {
+            if (verbose) std::cerr << "[ERR] Proxy CONNECT failed: " << tmp << std::endl;
+            set_error(error_out, "proxy CONNECT failed");
+            close_persistent_http_connection(conn);
+            return false;
+        }
+    }
+
+    if (use_ssl) {
+        SSL_library_init();
+        conn.ctx = SSL_CTX_new(TLS_client_method());
+        if (!conn.ctx) {
+            if (verbose) std::cerr << "[ERR] SSL Context failed" << std::endl;
+            set_error(error_out, "failed to initialize SSL context");
+            close_persistent_http_connection(conn);
+            return false;
+        }
+        SSL_CTX_set_verify(conn.ctx, SSL_VERIFY_NONE, NULL);
+        SSL_CTX_set_mode(conn.ctx, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS);
+
+        conn.ssl = SSL_new(conn.ctx);
+        SSL_set_tlsext_host_name(conn.ssl, host.c_str());
+        SSL_set_fd(conn.ssl, conn.sock);
+
+        if (SSL_connect(conn.ssl) <= 0) {
+            if (verbose) ERR_print_errors_fp(stderr);
+            set_error(error_out, "TLS handshake failed");
+            close_persistent_http_connection(conn);
+            return false;
+        }
+    }
+
+    return true;
+}
 }
 
 bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const HttpOptions& opts, std::string* error_out);
@@ -483,15 +639,16 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     }
 
     // 2. Parse Host and Path
+    std::string authority;
     std::string host;
     std::string path;
 
     size_t slash_pos = url_part.find('/');
     if (slash_pos != std::string::npos) {
-        host = url_part.substr(0, slash_pos);
+        authority = url_part.substr(0, slash_pos);
         path = url_part.substr(slash_pos);
     } else {
-        host = url_part;
+        authority = url_part;
         path = "/";
     }
 
@@ -505,6 +662,49 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     } else if (protocol != "http") {
         if (opts.verbose) std::cerr << "[ERR] Unsupported protocol: " << protocol << std::endl;
         set_error(error_out, "unsupported protocol: " + protocol);
+        return false;
+    }
+
+    std::string host_header = authority;
+    if (!authority.empty() && authority.front() == '[') {
+        size_t closing = authority.find(']');
+        if (closing == std::string::npos) {
+            set_error(error_out, "invalid IPv6 host syntax");
+            return false;
+        }
+
+        host = authority.substr(1, closing - 1);
+        if (closing + 1 < authority.size()) {
+            if (authority[closing + 1] != ':') {
+                set_error(error_out, "invalid IPv6 host syntax");
+                return false;
+            }
+            std::string port_text = authority.substr(closing + 2);
+            int parsed_port = std::atoi(port_text.c_str());
+            if (parsed_port <= 0) {
+                set_error(error_out, "invalid port in URL");
+                return false;
+            }
+            port = parsed_port;
+        }
+    } else {
+        size_t colon = authority.rfind(':');
+        if (colon != std::string::npos && authority.find(':') == colon) {
+            std::string port_text = authority.substr(colon + 1);
+            int parsed_port = std::atoi(port_text.c_str());
+            if (parsed_port <= 0) {
+                set_error(error_out, "invalid port in URL");
+                return false;
+            }
+            host = authority.substr(0, colon);
+            port = parsed_port;
+        } else {
+            host = authority;
+        }
+    }
+
+    if (host.empty()) {
+        set_error(error_out, "missing host in URL");
         return false;
     }
 
@@ -580,99 +780,60 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         if (opts.verbose) std::cerr << "[NET] Using Proxy: " << connect_host << ":" << connect_port << std::endl;
     }
 
-    // Resolve
-    std::string ip = ResolveDNS(connect_host);
-    if (ip.empty()) {
-        if (opts.verbose) std::cerr << "[ERR] Could not resolve: " << connect_host << std::endl;
-        set_error(error_out, "could not resolve " + connect_host);
-        return false;
-    }
-    if (opts.verbose) std::cerr << "[NET] Connecting to IP: " << ip << std::endl;
+    const bool allow_connection_reuse = opts.allow_connection_reuse &&
+        opts.data.empty() &&
+        (opts.method == "GET" || opts.method == "HEAD");
 
-    if (g_stop_sig) return false;
-
-    // 5. Socket Connection
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        if (opts.verbose) perror("[ERR] Socket creation failed");
-        set_error(error_out, std::string("socket creation failed: ") + strerror(errno));
-        return false;
-    }
-    configure_transfer_socket(sock);
-
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(connect_port);
-    inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr);
-
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        if (opts.verbose) perror("[ERR] Connection failed");
-        set_error(error_out, std::string("connection failed: ") + strerror(errno));
-        close(sock);
-        return false;
+    std::string pool_key;
+    PersistentHttpConnection transient_conn;
+    PersistentHttpConnection* active_conn = &transient_conn;
+    if (allow_connection_reuse) {
+        pool_key = build_http_connection_pool_key(
+            use_ssl,
+            host,
+            port,
+            connect_host,
+            connect_port,
+            proxy_str,
+            opts.auth
+        );
+        active_conn = &g_persistent_http_connection_pool.connections[pool_key];
     }
 
-    // 6. SSL Setup
-    SSL_CTX* ctx = nullptr;
-    SSL* ssl = nullptr;
-
-    if (!proxy_str.empty() && use_ssl) {
-        std::string connect_req = "CONNECT " + host + ":" + std::to_string(port) + " HTTP/1.1\r\n";
-        connect_req += "Host: " + host + ":" + std::to_string(port) + "\r\n";
-        connect_req += proxy_auth_header;
-        connect_req += "\r\n";
-        
-        if (opts.verbose) std::cerr << "[NET] Sending Proxy CONNECT..." << std::endl;
-        if (!write_all(sock, connect_req.c_str(), connect_req.length())) {
-            set_error(error_out, std::string("failed to send proxy CONNECT request: ") + strerror(errno));
-            close(sock);
+    bool reused_existing_connection = active_conn->sock >= 0;
+    if (!reused_existing_connection) {
+        if (!open_http_transport_connection(
+                connect_host,
+                connect_port,
+                host,
+                port,
+                use_ssl,
+                proxy_str,
+                proxy_auth_header,
+                opts.verbose,
+                *active_conn,
+                error_out
+            )) {
             return false;
         }
-        
-        char tmp[1024];
-        int len = read(sock, tmp, sizeof(tmp)-1);
-        if (len > 0) {
-            tmp[len] = 0;
-            if (std::string(tmp).find("200") == std::string::npos) {
-                if (opts.verbose) std::cerr << "[ERR] Proxy CONNECT failed: " << tmp << std::endl;
-                set_error(error_out, "proxy CONNECT failed");
-                close(sock); return false;
-            }
-        }
+    } else if (opts.verbose) {
+        std::cerr << "[NET] Reusing persistent connection for " << host << std::endl;
     }
 
-    if (use_ssl) {
-        SSL_library_init();
-        ctx = SSL_CTX_new(TLS_client_method());
-        if (!ctx) {
-            if (opts.verbose) std::cerr << "[ERR] SSL Context failed" << std::endl;
-            set_error(error_out, "failed to initialize SSL context");
-            close(sock); return false;
-        }
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-        SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS);
-
-        ssl = SSL_new(ctx);
-        SSL_set_tlsext_host_name(ssl, host.c_str());
-        SSL_set_fd(ssl, sock);
-
-        if (SSL_connect(ssl) <= 0) {
-            if (opts.verbose) ERR_print_errors_fp(stderr);
-            set_error(error_out, "TLS handshake failed");
-            SSL_free(ssl); SSL_CTX_free(ctx); close(sock);
-            return false;
-        }
-    }
+    int& sock = active_conn->sock;
+    SSL*& ssl = active_conn->ssl;
+    auto close_active_connection = [&]() {
+        close_persistent_http_connection(*active_conn);
+    };
 
     // 7. Send Request
     std::string method = opts.method;
     std::string full_path = (!proxy_str.empty() && !use_ssl) ? url_in : path;
     
     std::string req = method + " " + full_path + " HTTP/1.1\r\n";
-    req += "Host: " + host + "\r\n";
+    req += "Host: " + host_header + "\r\n";
     req += "User-Agent: " + opts.user_agent + "\r\n";
-    req += "Connection: close\r\n";
+    req += "Connection: " + std::string(allow_connection_reuse ? "keep-alive" : "close") + "\r\n";
     if (!opts.auth.empty()) req += "Authorization: Basic " + base64_encode(opts.auth) + "\r\n";
     if (!proxy_str.empty() && !use_ssl) req += proxy_auth_header;
     
@@ -683,40 +844,254 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
 
     if (opts.verbose) std::cerr << "[NET] Sending Request..." << std::endl;
     
-    if (use_ssl) {
-        if (!ssl_write_all(ssl, req.c_str(), req.length())) {
-            if (opts.verbose) ERR_print_errors_fp(stderr);
-            set_error(error_out, "failed to send HTTPS request");
-            SSL_free(ssl); SSL_CTX_free(ctx); close(sock);
-            return false;
+    auto send_request = [&]() -> bool {
+        if (use_ssl) {
+            if (!ssl_write_all(ssl, req.c_str(), req.length())) {
+                if (opts.verbose) ERR_print_errors_fp(stderr);
+                set_error(error_out, "failed to send HTTPS request");
+                return false;
+            }
+        } else {
+            if (!write_all(sock, req.c_str(), req.length())) {
+                if (opts.verbose) perror("[ERR] Write failed");
+                set_error(error_out, std::string("failed to send HTTP request: ") + strerror(errno));
+                return false;
+            }
         }
-    } else {
-        if (!write_all(sock, req.c_str(), req.length())) {
-            if (opts.verbose) perror("[ERR] Write failed");
-            set_error(error_out, std::string("failed to send HTTP request: ") + strerror(errno));
-            close(sock); return false;
+        return true;
+    };
+
+    if (!send_request()) {
+        if (reused_existing_connection) {
+            close_persistent_http_connection(*active_conn);
+            if (!open_http_transport_connection(
+                    connect_host,
+                    connect_port,
+                    host,
+                    port,
+                    use_ssl,
+                    proxy_str,
+                    proxy_auth_header,
+                    opts.verbose,
+                    *active_conn,
+                    error_out
+                )) {
+                return false;
+            }
+            if (!send_request()) {
+                close_persistent_http_connection(*active_conn);
+                return false;
+            }
+            reused_existing_connection = false;
+        } else {
+            close_persistent_http_connection(*active_conn);
+            return false;
         }
     }
 
     // 8. Read Response
     std::array<char, kTransferBufferSize> buffer;
-    int bytes;
-    
+    int bytes = 0;
+
     long content_length = -1;
     long content_range_total = -1;
+    long response_body_expected_bytes = -1;
     long total_read = 0;
     std::string header_buffer;
+    std::string body_buffer;
     bool header_parsed = false;
-    
+    bool response_has_body = false;
+    bool response_uses_chunked_encoding = false;
+    bool server_requested_close = false;
+    bool response_complete = false;
+    bool response_can_reuse_connection = false;
+    bool fatal_read_error = false;
+    bool eof_reached = false;
+    size_t chunk_bytes_remaining = 0;
+    bool awaiting_chunk_size = true;
+    bool parsing_chunk_trailers = false;
+
     auto start_time = std::chrono::steady_clock::now();
     auto last_update = start_time;
     auto last_progress = start_time;
-    
+
+    auto update_progress = [&](bool force) {
+        if (!(opts.show_progress || opts.progress_callback) || !header_parsed) return;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+        auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
+        if (!force && delta <= 200) return;
+
+        double speed = 0;
+        if (elapsed > 0) speed = static_cast<double>(total_read) * 1000.0 / elapsed;
+
+        size_t progress_total = 0;
+        if (content_range_total > 0) {
+            progress_total = static_cast<size_t>(content_range_total);
+        } else if (opts.progress_total_hint > 0) {
+            progress_total = opts.progress_total_hint;
+        } else if (content_length > 0) {
+            progress_total = opts.progress_base_bytes + static_cast<size_t>(content_length);
+        }
+
+        size_t transferred_total = opts.progress_base_bytes + static_cast<size_t>(total_read);
+        if (opts.progress_callback) {
+            opts.progress_callback(transferred_total, progress_total, speed);
+        }
+
+        if (opts.show_progress) {
+            int percent = 0;
+            if (progress_total > 0) {
+                percent = static_cast<int>((transferred_total * 100) / progress_total);
+            }
+            if (percent > 100) percent = 100;
+
+            const int bar_width = 25;
+            int filled = (percent * bar_width) / 100;
+
+            std::cout << "\r[";
+            for (int i = 0; i < bar_width; ++i) {
+                std::cout << (i < filled ? "=" : " ");
+            }
+            std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
+        }
+
+        last_update = now;
+    };
+
+    auto fail_response = [&](const std::string& message) {
+        set_error(error_out, message);
+        close_active_connection();
+        return false;
+    };
+    auto current_error_or = [&](const std::string& fallback) {
+        if (error_out && !error_out->empty()) return *error_out;
+        return fallback;
+    };
+
+    auto flush_identity_body_buffer = [&]() -> bool {
+        if (!response_has_body) {
+            if (!body_buffer.empty()) {
+                set_error(error_out, "unexpected response body for body-less response");
+                return false;
+            }
+            response_complete = true;
+            response_can_reuse_connection = allow_connection_reuse && !server_requested_close;
+            if (opts.verbose) {
+                std::cerr << "[NET] Response complete (no body)." << std::endl;
+            }
+            return true;
+        }
+
+        if (response_body_expected_bytes >= 0) {
+            long remaining = response_body_expected_bytes - total_read;
+            if (remaining < 0) {
+                set_error(error_out, "received more data than declared by Content-Length");
+                return false;
+            }
+            size_t emit_bytes = std::min(body_buffer.size(), static_cast<size_t>(remaining));
+            if (emit_bytes > 0) {
+                out.write(body_buffer.data(), static_cast<std::streamsize>(emit_bytes));
+                total_read += static_cast<long>(emit_bytes);
+                body_buffer.erase(0, emit_bytes);
+            }
+
+            if (total_read == response_body_expected_bytes) {
+                if (!body_buffer.empty()) {
+                    set_error(error_out, "response body exceeded declared Content-Length");
+                    return false;
+                }
+                response_complete = true;
+                response_can_reuse_connection = allow_connection_reuse && !server_requested_close;
+                if (opts.verbose) {
+                    std::cerr << "[NET] Response complete via Content-Length (" << total_read << " bytes)." << std::endl;
+                }
+            }
+            return true;
+        }
+
+        if (!body_buffer.empty()) {
+            out.write(body_buffer.data(), static_cast<std::streamsize>(body_buffer.size()));
+            total_read += static_cast<long>(body_buffer.size());
+            body_buffer.clear();
+        }
+        return true;
+    };
+
+    auto flush_chunked_body_buffer = [&]() -> bool {
+        while (true) {
+            if (parsing_chunk_trailers) {
+                size_t line_end = body_buffer.find("\r\n");
+                if (line_end == std::string::npos) return true;
+
+                if (line_end == 0) {
+                    body_buffer.erase(0, 2);
+                    response_complete = true;
+                    response_can_reuse_connection = allow_connection_reuse && !server_requested_close;
+                    if (opts.verbose) {
+                        std::cerr << "[NET] Response complete via chunked transfer (" << total_read << " bytes)." << std::endl;
+                    }
+                    return true;
+                }
+
+                body_buffer.erase(0, line_end + 2);
+                continue;
+            }
+
+            if (awaiting_chunk_size) {
+                size_t line_end = body_buffer.find("\r\n");
+                if (line_end == std::string::npos) return true;
+
+                std::string size_line = trim_copy(body_buffer.substr(0, line_end));
+                size_t ext_pos = size_line.find(';');
+                if (ext_pos != std::string::npos) {
+                    size_line = trim_copy(size_line.substr(0, ext_pos));
+                }
+
+                char* end = nullptr;
+                errno = 0;
+                unsigned long parsed_size = std::strtoul(size_line.c_str(), &end, 16);
+                if (errno != 0 || end == size_line.c_str() || (end && *end != '\0')) {
+                    set_error(error_out, "invalid chunked transfer encoding");
+                    return false;
+                }
+
+                chunk_bytes_remaining = static_cast<size_t>(parsed_size);
+                body_buffer.erase(0, line_end + 2);
+                awaiting_chunk_size = false;
+
+                if (chunk_bytes_remaining == 0) {
+                    parsing_chunk_trailers = true;
+                }
+            }
+
+            if (parsing_chunk_trailers) {
+                continue;
+            }
+
+            if (body_buffer.size() < chunk_bytes_remaining + 2) return true;
+            if (body_buffer.compare(chunk_bytes_remaining, 2, "\r\n") != 0) {
+                set_error(error_out, "malformed chunk terminator");
+                return false;
+            }
+
+            if (chunk_bytes_remaining > 0) {
+                out.write(body_buffer.data(), static_cast<std::streamsize>(chunk_bytes_remaining));
+                total_read += static_cast<long>(chunk_bytes_remaining);
+            }
+
+            body_buffer.erase(0, chunk_bytes_remaining + 2);
+            chunk_bytes_remaining = 0;
+            awaiting_chunk_size = true;
+        }
+    };
+
     // Set a timeout for the socket to allow checking signals periodically
-    struct timeval tv = {1, 0}; // 1 second timeout
+    struct timeval tv = {1, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    while (true) {
+    while (!response_complete) {
         if (g_stop_sig) {
             if (opts.verbose) std::cerr << "\n[NET] Interrupted by signal." << std::endl;
             break;
@@ -727,251 +1102,256 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
         } else {
             bytes = read(sock, buffer.data(), buffer.size());
         }
-        
+
         if (bytes <= 0) {
             if (use_ssl) {
                 int ssl_err = SSL_get_error(ssl, bytes);
                 if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-                    continue; 
+                    continue;
                 }
-                // Check if it's a real error or just clean close
                 if (ssl_err == SSL_ERROR_SYSCALL && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
-                     if (errno == EINTR) continue; // Signal handled, loop will check g_stop_sig
-                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                         auto now = std::chrono::steady_clock::now();
-                         auto stalled_for = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count();
-                         if (stalled_for >= opts.timeout) {
-                             if (opts.verbose) std::cerr << "[ERR] Download stalled for " << stalled_for << " seconds." << std::endl;
-                             set_error(error_out, "timed out after " + std::to_string(stalled_for) + " seconds without receiving data");
-                             if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                             close(sock);
-                             return false;
-                         }
-                         continue; // Timeout, check g_stop_sig
-                     }
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        auto now = std::chrono::steady_clock::now();
+                        auto stalled_for = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count();
+                        if (stalled_for >= opts.timeout) {
+                            if (opts.verbose) {
+                                std::cerr << "[ERR] Download stalled for " << stalled_for << " seconds." << std::endl;
+                            }
+                            return fail_response(
+                                "timed out after " + std::to_string(stalled_for) + " seconds without receiving data"
+                            );
+                        }
+                        continue;
+                    }
                 }
-                if (ssl_err != SSL_ERROR_ZERO_RETURN) {
-                    set_error(error_out, "TLS read failed");
+                if (ssl_err == SSL_ERROR_SYSCALL && bytes == 0 && errno == 0) {
+                    eof_reached = true;
+                    break;
                 }
-                break; // Real error or close
+                if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+                    eof_reached = true;
+                    break;
+                }
+                set_error(error_out, "TLS read failed");
+                fatal_read_error = true;
+                break;
             } else {
-                if (bytes < 0) {
-                     if (errno == EINTR) continue;
-                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                         auto now = std::chrono::steady_clock::now();
-                         auto stalled_for = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count();
-                         if (stalled_for >= opts.timeout) {
-                             if (opts.verbose) std::cerr << "[ERR] Download stalled for " << stalled_for << " seconds." << std::endl;
-                             set_error(error_out, "timed out after " + std::to_string(stalled_for) + " seconds without receiving data");
-                             close(sock);
-                             return false;
-                         }
-                         continue;
-                     }
-                     set_error(error_out, std::string("socket read failed: ") + strerror(errno));
+                if (bytes == 0) {
+                    eof_reached = true;
+                    break;
                 }
-                break; // EOF or Error
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto stalled_for = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count();
+                    if (stalled_for >= opts.timeout) {
+                        if (opts.verbose) {
+                            std::cerr << "[ERR] Download stalled for " << stalled_for << " seconds." << std::endl;
+                        }
+                        return fail_response(
+                            "timed out after " + std::to_string(stalled_for) + " seconds without receiving data"
+                        );
+                    }
+                    continue;
+                }
+                set_error(error_out, std::string("socket read failed: ") + strerror(errno));
+                fatal_read_error = true;
+                break;
             }
         }
 
         last_progress = std::chrono::steady_clock::now();
 
         if (!header_parsed) {
-            header_buffer.append(buffer.data(), bytes);
+            header_buffer.append(buffer.data(), static_cast<size_t>(bytes));
             size_t header_end = header_buffer.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                std::string headers = header_buffer.substr(0, header_end);
-                std::string lower_headers = lower_copy(headers);
+            if (header_end == std::string::npos) continue;
 
-                int status_code = parse_http_status_code(headers);
-                size_t first_line_end = headers.find("\r\n");
-                std::string status_line = first_line_end == std::string::npos
-                    ? headers
-                    : headers.substr(0, first_line_end);
-                bool is_redirect = status_code == 301 || status_code == 302 ||
-                                   status_code == 303 || status_code == 307 ||
-                                   status_code == 308;
-                bool is_partial = status_code == 206;
-                bool is_ok = status_code == 200 || status_code == 201 || is_partial;
+            std::string headers = header_buffer.substr(0, header_end);
+            std::string lower_headers = lower_copy(headers);
 
-                if (is_redirect) {
-                    if (!opts.follow_location) {
-                        if (opts.verbose) std::cerr << "[ERR] Redirect received but redirect following is disabled: " << status_line << std::endl;
-                        set_error(error_out, "redirect received but follow_location is disabled");
-                        if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                        close(sock);
-                        return false;
-                    }
+            int status_code = parse_http_status_code(headers);
+            size_t first_line_end = headers.find("\r\n");
+            std::string status_line = first_line_end == std::string::npos
+                ? headers
+                : headers.substr(0, first_line_end);
+            bool is_redirect = status_code == 301 || status_code == 302 ||
+                               status_code == 303 || status_code == 307 ||
+                               status_code == 308;
+            bool is_partial = status_code == 206;
+            bool is_ok = status_code == 200 || status_code == 201 || is_partial;
 
-                    std::string redirect_url = parse_header_value(headers, lower_headers, "location: ");
-                    if (redirect_url.empty()) {
-                        if (opts.verbose) std::cerr << "[ERR] Redirect response missing Location header." << std::endl;
-                        set_error(error_out, "redirect response missing Location header");
-                        if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                        close(sock);
-                        return false;
-                    }
-                    if (redirect_url[0] == '/') {
-                        redirect_url = protocol + "://" + host + redirect_url;
-                    }
-
-                    if (opts.verbose) std::cerr << "[NET] Following redirect to " << redirect_url << std::endl;
-                    if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                    close(sock);
-
-                    HttpOptions redirect_opts = opts;
-                    redirect_opts.max_redirects = opts.max_redirects - 1;
-                    return HttpRequestInternal(redirect_url, out, redirect_opts, error_out);
-                }
-
-                if (!is_ok) {
-                    if (opts.verbose) std::cerr << "[ERR] HTTP Status Error: " << status_line << std::endl;
-                    set_error(error_out, "HTTP status error: " + status_line);
-                    if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                    close(sock);
-                    return false;
-                }
-
-                if (opts.resume_from > 0 && !is_partial) {
+            if (is_redirect) {
+                if (!opts.follow_location) {
                     if (opts.verbose) {
-                        std::cerr << "[ERR] Resume request was not honored by server: "
+                        std::cerr << "[ERR] Redirect received but redirect following is disabled: "
                                   << status_line << std::endl;
                     }
-                    set_error(error_out, "resume request not honored");
-                    if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-                    close(sock);
-                    return false;
+                    return fail_response("redirect received but follow_location is disabled");
                 }
 
-                content_length = parse_content_length_header(headers, lower_headers);
+                std::string redirect_url = parse_header_value(headers, lower_headers, "location: ");
+                if (redirect_url.empty()) {
+                    if (opts.verbose) {
+                        std::cerr << "[ERR] Redirect response missing Location header." << std::endl;
+                    }
+                    return fail_response("redirect response missing Location header");
+                }
+                if (redirect_url[0] == '/') {
+                    redirect_url = protocol + "://" + host + redirect_url;
+                }
 
-                size_t cr_pos = lower_headers.find("content-range: ");
-                if (cr_pos != std::string::npos) {
-                    size_t val_start = cr_pos + 15;
-                    size_t val_end = lower_headers.find("\r\n", val_start);
-                    if (val_end != std::string::npos) {
-                        std::string range_value = trim_copy(headers.substr(val_start, val_end - val_start));
-                        size_t slash_pos = range_value.rfind('/');
-                        if (slash_pos != std::string::npos) {
-                            std::string total_str = trim_copy(range_value.substr(slash_pos + 1));
-                            if (!total_str.empty() && total_str != "*") {
-                                content_range_total = std::atol(total_str.c_str());
-                            }
-                        }
+                if (opts.verbose) std::cerr << "[NET] Following redirect to " << redirect_url << std::endl;
+                close_active_connection();
+
+                HttpOptions redirect_opts = opts;
+                redirect_opts.max_redirects = opts.max_redirects - 1;
+                return HttpRequestInternal(redirect_url, out, redirect_opts, error_out);
+            }
+
+            if (!is_ok) {
+                if (opts.verbose) {
+                    std::cerr << "[ERR] HTTP Status Error: " << status_line << std::endl;
+                }
+                return fail_response("HTTP status error: " + status_line);
+            }
+
+            if (opts.resume_from > 0 && !is_partial) {
+                if (opts.verbose) {
+                    std::cerr << "[ERR] Resume request was not honored by server: "
+                              << status_line << std::endl;
+                }
+                return fail_response("resume request not honored");
+            }
+
+            response_has_body = opts.method != "HEAD" &&
+                !((status_code >= 100 && status_code < 200) || status_code == 204 || status_code == 304);
+            content_length = parse_content_length_header(headers, lower_headers);
+            response_body_expected_bytes = response_has_body ? content_length : 0;
+            server_requested_close = lower_copy(parse_header_value(headers, lower_headers, "connection: "))
+                .find("close") != std::string::npos;
+            response_uses_chunked_encoding = response_has_body &&
+                lower_copy(parse_header_value(headers, lower_headers, "transfer-encoding: "))
+                    .find("chunked") != std::string::npos;
+
+            if (opts.verbose) {
+                std::cerr << "[NET] Response headers:\n" << headers << "\n";
+                std::cerr << "[NET] Parsed response: status=" << status_code
+                          << " content_length=" << content_length
+                          << " chunked=" << response_uses_chunked_encoding
+                          << " connection_close=" << server_requested_close
+                          << " has_body=" << response_has_body
+                          << std::endl;
+            }
+
+            size_t cr_pos = lower_headers.find("content-range: ");
+            if (cr_pos != std::string::npos) {
+                size_t val_start = cr_pos + 15;
+                size_t val_end = lower_headers.find("\r\n", val_start);
+                if (val_end == std::string::npos) val_end = lower_headers.size();
+                std::string range_value = trim_copy(headers.substr(val_start, val_end - val_start));
+                size_t slash_pos = range_value.rfind('/');
+                if (slash_pos != std::string::npos) {
+                    std::string total_str = trim_copy(range_value.substr(slash_pos + 1));
+                    if (!total_str.empty() && total_str != "*") {
+                        content_range_total = std::atol(total_str.c_str());
                     }
                 }
+            }
 
-                if (opts.include_headers) {
-                    out.write(header_buffer.c_str(), header_end + 4);
-                }
+            if (opts.include_headers) {
+                out.write(header_buffer.c_str(), static_cast<std::streamsize>(header_end + 4));
+            }
 
-                size_t body_offset = header_end + 4;
-                if (header_buffer.length() > body_offset) {
-                    out.write(header_buffer.c_str() + body_offset, header_buffer.length() - body_offset);
-                    total_read += (header_buffer.length() - body_offset);
-                }
-                header_parsed = true;
+            size_t body_offset = header_end + 4;
+            if (header_buffer.length() > body_offset) {
+                body_buffer.assign(header_buffer.data() + body_offset, header_buffer.length() - body_offset);
+            }
+
+            header_parsed = true;
+
+            if (response_uses_chunked_encoding) {
+                if (!flush_chunked_body_buffer()) return fail_response(current_error_or("chunked decoding failed"));
+            } else {
+                if (!flush_identity_body_buffer()) return fail_response(current_error_or("response body processing failed"));
             }
         } else {
-            out.write(buffer.data(), bytes);
-            total_read += bytes;
-        }
-        
-        if ((opts.show_progress || opts.progress_callback) && header_parsed) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-            auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
-
-            if (delta > 200 || bytes <= 0) { // Update every 200ms
-                 double speed = 0;
-                 if (elapsed > 0) speed = (double)total_read * 1000.0 / elapsed;
-                 size_t progress_total = 0;
-                 if (content_range_total > 0) {
-                     progress_total = static_cast<size_t>(content_range_total);
-                 } else if (opts.progress_total_hint > 0) {
-                     progress_total = opts.progress_total_hint;
-                 } else if (content_length > 0) {
-                     progress_total = opts.progress_base_bytes + static_cast<size_t>(content_length);
-                 }
-                 size_t transferred_total = opts.progress_base_bytes + static_cast<size_t>(total_read);
-
-                 if (opts.progress_callback) {
-                     opts.progress_callback(transferred_total, progress_total, speed);
-                 }
-
-                 if (opts.show_progress) {
-                     int percent = 0;
-                     if (progress_total > 0) percent = (int)((transferred_total * 100) / progress_total);
-                     if (percent > 100) percent = 100;
-
-                     // Bar: [===              ]
-                     int bar_width = 25;
-                     int filled = (percent * bar_width) / 100;
-
-                     std::cout << "\r[";
-                     for(int i=0; i<bar_width; i++) {
-                         if (i < filled) std::cout << "=";
-                         else std::cout << " ";
-                     }
-                     std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
-                 }
-
-                 last_update = now;
+            body_buffer.append(buffer.data(), static_cast<size_t>(bytes));
+            if (response_uses_chunked_encoding) {
+                if (!flush_chunked_body_buffer()) return fail_response(current_error_or("chunked decoding failed"));
+            } else {
+                if (!flush_identity_body_buffer()) return fail_response(current_error_or("response body processing failed"));
             }
         }
+
+        update_progress(false);
     }
-    
-    // Check if we were interrupted
+
     if (g_stop_sig) {
-         set_error(error_out, "interrupted by signal");
-         if (use_ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
-         close(sock);
-         return false;
+        close_active_connection();
+        set_error(error_out, "interrupted by signal");
+        return false;
     }
 
-    // Force final progress update to 100% if valid download
-    if ((opts.show_progress || opts.progress_callback) && header_parsed && content_length > 0 && total_read >= content_length) {
-         auto now = std::chrono::steady_clock::now();
-         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-         double speed = 0;
-         if (elapsed > 0) speed = (double)total_read * 1000.0 / elapsed;
-         size_t progress_total = 0;
-         if (content_range_total > 0) {
-             progress_total = static_cast<size_t>(content_range_total);
-         } else if (opts.progress_total_hint > 0) {
-             progress_total = opts.progress_total_hint;
-         } else if (content_length > 0) {
-             progress_total = opts.progress_base_bytes + static_cast<size_t>(content_length);
-         }
-         size_t transferred_total = opts.progress_base_bytes + static_cast<size_t>(total_read);
-
-         if (opts.progress_callback) {
-             opts.progress_callback(transferred_total, progress_total, speed);
-         }
-
-         if (opts.show_progress) {
-             int percent = 100;
-             int bar_width = 25;
-
-             std::cout << "\r[";
-             for(int i=0; i<bar_width; i++) std::cout << "=";
-             std::cout << "] " << percent << "% (" << format_speed(speed) << ") " << std::flush;
-         }
+    if (!header_parsed) {
+        close_active_connection();
+        if (fatal_read_error && error_out && !error_out->empty()) return false;
+        set_error(error_out, "no HTTP response received");
+        return false;
     }
+
+    if (fatal_read_error) {
+        close_active_connection();
+        return false;
+    }
+
+    if (!response_complete) {
+        if (response_uses_chunked_encoding) {
+            close_active_connection();
+            if (opts.verbose) {
+                std::cerr << "[ERR] Incomplete chunked response." << std::endl;
+            }
+            set_error(error_out, "incomplete chunked response");
+            return false;
+        }
+
+        if (response_body_expected_bytes >= 0) {
+            close_active_connection();
+            if (opts.verbose) {
+                std::cerr << "[ERR] Incomplete download. Expected "
+                          << response_body_expected_bytes << " bytes, got " << total_read << std::endl;
+            }
+            set_error(
+                error_out,
+                "incomplete download (" + std::to_string(total_read) + "/" +
+                    std::to_string(response_body_expected_bytes) + " bytes)"
+            );
+            return false;
+        }
+
+        if (!eof_reached) {
+            close_active_connection();
+            set_error(error_out, "response terminated unexpectedly");
+            return false;
+        }
+
+        if (!flush_identity_body_buffer()) {
+            close_active_connection();
+            return false;
+        }
+        response_complete = true;
+        response_can_reuse_connection = false;
+    }
+
+    update_progress(true);
 
     if (opts.show_progress) std::cout << std::endl;
 
-    if (use_ssl) {
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
+    if (!allow_connection_reuse || !response_can_reuse_connection) {
+        close_active_connection();
     }
-    close(sock);
-    if (content_length > 0 && total_read != content_length && opts.method != "HEAD") {
-        if (opts.verbose) std::cerr << "[ERR] Incomplete download. Expected " << content_length << " bytes, got " << total_read << std::endl;
-        set_error(error_out, "incomplete download (" + std::to_string(total_read) + "/" + std::to_string(content_length) + " bytes)");
-        return false;
-    }
+
     set_error(error_out, "");
     return true;
 }
@@ -1184,19 +1564,33 @@ bool DownloadFile(
     std::string* error_out,
     bool show_progress,
     std::function<void(size_t, size_t, double)> progress_callback,
-    size_t* bytes_transferred_out
+    size_t* bytes_transferred_out,
+    long known_remote_size
 ) {
     set_error(error_out, "");
     if (bytes_transferred_out) *bytes_transferred_out = 0;
     std::string temp_path = dest_path + ".part";
 
     RemoteFileInfo remote_info;
-    long size = -1;
-    bool have_remote_info = probe_remote_file(url, &remote_info);
-    if (have_remote_info) size = remote_info.content_length;
+    long size = known_remote_size > 0 ? known_remote_size : -1;
+    bool have_partial = has_partial_download(temp_path);
+    bool should_probe_remote = true;
+    if (!have_partial &&
+        known_remote_size > 0 &&
+        known_remote_size <= kParallelDownloadThresholdBytes) {
+        should_probe_remote = false;
+    }
+
+    bool have_remote_info = false;
+    if (should_probe_remote) {
+        have_remote_info = probe_remote_file(url, &remote_info);
+        if (have_remote_info && remote_info.content_length > 0) {
+            size = remote_info.content_length;
+        }
+    }
 
     // Use multi-part downloads only for fresh transfers when the server confirms byte ranges.
-    if (!has_partial_download(temp_path) &&
+    if (!have_partial &&
         have_remote_info &&
         remote_info.content_length > kParallelDownloadThresholdBytes &&
         remote_info.accepts_ranges) {
@@ -1222,6 +1616,7 @@ bool DownloadFile(
     opts.show_progress = show_progress && !verbose;
     opts.progress_callback = std::move(progress_callback);
     opts.follow_location = true;
+    opts.allow_connection_reuse = true;
     opts.retry_count = 0; // Disable inner retry
 
     // Robust Retry Loop (Manual)
