@@ -329,6 +329,43 @@ std::string lower_copy(std::string value) {
     return value;
 }
 
+bool host_matches_no_proxy_token(const std::string& host, std::string token) {
+    token = trim_copy(lower_copy(token));
+    if (token.empty()) return false;
+    if (token == "*") return true;
+
+    if (token.front() == '.') {
+        return host.size() > token.size() - 1 &&
+            host.compare(host.size() - (token.size() - 1), token.size() - 1, token.substr(1)) == 0;
+    }
+
+    if (host == token) return true;
+    return host.size() > token.size() &&
+        host.compare(host.size() - token.size(), token.size(), token) == 0 &&
+        host[host.size() - token.size() - 1] == '.';
+}
+
+bool should_bypass_proxy_for_host(const std::string& host) {
+    std::string lower_host = lower_copy(host);
+    if (lower_host == "localhost" || lower_host == "127.0.0.1" || lower_host == "::1") {
+        return true;
+    }
+
+    const char* no_proxy = getenv("no_proxy");
+    if (!no_proxy || !*no_proxy) no_proxy = getenv("NO_PROXY");
+    if (!no_proxy || !*no_proxy) return false;
+
+    std::stringstream ss(no_proxy);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (host_matches_no_proxy_token(lower_host, token)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 int parse_http_status_code(const std::string& headers) {
     size_t first_line_end = headers.find("\r\n");
     std::string status_line = first_line_end == std::string::npos
@@ -753,6 +790,13 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                     }
                 }
             }
+        }
+    }
+
+    if (!proxy_str.empty()) {
+        if (should_bypass_proxy_for_host(host)) {
+            if (opts.verbose) std::cerr << "[NET] Bypassing proxy for " << host << std::endl;
+            proxy_str.clear();
         }
     }
 
@@ -1236,7 +1280,6 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
                     .find("chunked") != std::string::npos;
 
             if (opts.verbose) {
-                std::cerr << "[NET] Response headers:\n" << headers << "\n";
                 std::cerr << "[NET] Parsed response: status=" << status_code
                           << " content_length=" << content_length
                           << " chunked=" << response_uses_chunked_encoding
@@ -1295,6 +1338,15 @@ bool HttpRequestInternal(const std::string& url_in, std::ostream& out, const Htt
     }
 
     if (!header_parsed) {
+        if (reused_existing_connection) {
+            if (opts.verbose) {
+                std::cerr << "[NET] Reused connection returned no response; retrying on a fresh socket."
+                          << std::endl;
+            }
+            close_active_connection();
+            return HttpRequestInternal(url_in, out, opts, error_out);
+        }
+
         close_active_connection();
         if (fatal_read_error && error_out && !error_out->empty()) return false;
         set_error(error_out, "no HTTP response received");
