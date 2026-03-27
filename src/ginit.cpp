@@ -179,6 +179,11 @@ void configure_selinux_runtime() {
         }
     }
 
+    if (is_live) {
+        std::cout << "[GINIT] Live environment detected; skipping SELinux relabel and restorecon passes." << std::endl;
+        return;
+    }
+
     const std::string file_contexts = find_first_existing_path({
         "/etc/selinux/" + policy_name + "/contexts/files/file_contexts",
         "/etc/selinux/default/contexts/files/file_contexts",
