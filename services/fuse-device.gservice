@@ -1,0 +1,20 @@
+service "fuse-device" {
+    meta {
+        description = "Ensure /dev/fuse is available"
+        deps {
+            after = ["udev-settle"]
+            requires = ["udev-settle"]
+        }
+    }
+
+    process {
+        type = "oneshot"
+        commands {
+            start = "/usr/libexec/geminios/ensure-fuse-device"
+        }
+    }
+
+    install {
+        wanted_by = ["multi-user.target"]
+    }
+}

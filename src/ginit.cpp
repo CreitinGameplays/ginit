@@ -494,6 +494,7 @@ service_manager.load_services_from_dir("/etc/ginit/services/system");
 service_manager.enable_service("udevd");
 service_manager.enable_service("udev-trigger");
 service_manager.enable_service("udev-settle");
+service_manager.enable_service("fuse-device");
 service_manager.enable_service("network");
 service_manager.enable_service("dbus");
 service_manager.enable_service("elogind");
