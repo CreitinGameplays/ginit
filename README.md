@@ -1,51 +1,47 @@
-# Ginit: GeminiOS Init System & Core Utilities
+# Ginit
 
-Ginit is the core initialization system for GeminiOS. It handles process supervision, service management (via `.gservice` files), user authentication, and TTY management.
+Ginit is the GeminiOS init system and a small set of companion utilities. The design goal is to keep PID 1 boring: mount the base runtime, supervise a few services, expose a tiny text control socket, and avoid burying policy in hidden state.
+
+## Design Notes
+
+- Boot policy is data, not magic. Vendor defaults live in `/usr/lib/ginit/boot-services.conf`.
+- Local administrator overrides live in `/etc/ginit/boot-services.conf`.
+- Persistent enablement is still explicit symlink-style state in `/etc/ginit/services/system/`.
+- `ginit` does not rewrite boot defaults at startup anymore; PID 1 reads them and starts what they describe.
+- Service logs are plain files in `/var/log/ginit/<service>.log`.
+- Inspection should not depend on the daemon being reachable. `ginit show` and `ginit check` work from files.
 
 ## Components
 
-- **ginit**: The system init (PID 1). Manages mounting, hardware initialization, and process supervision.
-- **login**: Standalone login manager. Handles user authentication and session setup.
-- **getty**: TTY manager. Opens TTY devices and launches the login program.
-- **libgemcore.a**: Static library containing shared logic for networking, signals, and user management.
+- `ginit`: PID 1 plus the service-control CLI.
+- `ginit-netcfg`: network configuration helper kept outside PID 1.
+- `login`: standalone login manager.
+- `getty`: simple TTY/login launcher.
+- `libgemcore.a`: shared runtime code.
 
-## Directory Structure
+## Layout
 
-- `src/`: Source code for all components.
-- `services/`: Default system service configurations (`.gservice`).
-- `lib/`: Compiled static libraries.
-- `bin/`: Compiled executable binaries.
+- `src/`: source code.
+- `services/`: shipped `.gservice` units.
+- `boot-services.conf`: shipped boot preset.
+- `bin/`: built executables.
+- `lib/`: built static library.
 
-## Building Standalone
-
-To build Ginit manually on a Linux system:
+## Build
 
 ```bash
 cd ginit
 make
+make install DESTDIR=/path/to/rootfs
 ```
 
-To install to a specific root directory (e.g., for OS distribution):
+## Service Files
 
-```bash
-make install DESTDIR=/path/to/your/rootfs
-```
+Shipped service definitions live in `/usr/lib/ginit/services/`. Persistent local enablement lives in `/etc/ginit/services/system/`.
 
-### Dependencies
+Example:
 
-- A C++17 compliant compiler (g++ recommended).
-- OpenSSL (libssl and libcrypto).
-- zlib.
-- zstd.
-
-## Service Management
-
-Ginit uses a custom service format. Services are stored in:
-- System: `/etc/ginit/services/system/`
-- User: `/etc/ginit/services/user/`
-
-Example `.gservice` file:
-```
+```gservice
 service "dbus" {
     meta {
         description = "D-Bus System Message Bus"
@@ -58,10 +54,39 @@ service "dbus" {
 }
 ```
 
-## Integration with GeminiOS
+## Boot Presets
 
-Within the GeminiOS build system, Ginit is automatically built and installed by the `geminios_core` port.
-To force a rebuild within the OS:
+`/usr/lib/ginit/boot-services.conf` is the vendor default list. `/etc/ginit/boot-services.conf` is merged after it.
+
+- A plain service name adds it to the boot preset.
+- A line starting with `-` removes a vendor preset entry.
+- `enable` and `disable` affect persistent local state, not the vendor preset file.
+
+Example override:
+
+```text
+-network
+sshd
+```
+
+## Administration
+
+```bash
+ginit status
+ginit show dbus
+ginit check
+ginit enable sshd
+ginit disable elogind
+```
+
+- `status` talks to the running daemon and shows runtime state.
+- `show` prefers live runtime data, but falls back to file inspection.
+- `check` validates service files, dependency references, and boot preset entries without needing PID 1.
+
+## GeminiOS Build Integration
+
+GeminiOS builds and installs Ginit through the `geminios_core` port.
+
 ```bash
 python3 builder.py geminios_core --force
 ```

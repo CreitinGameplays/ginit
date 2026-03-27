@@ -1,14 +1,16 @@
+#include <array>
+#include <cerrno>
 #include <iostream>
+#include <map>
+#include <poll.h>
+#include <set>
 #include <string>
 #include <vector>
-#include <map>
 #include <unistd.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/reboot.h>
-#include <sys/sysinfo.h>
-#include <sys/utsname.h>
 #include <dirent.h>
 #include <cctype>
 #include <cstring>
@@ -18,18 +20,403 @@
 #include <csignal>
 #include <sys/wait.h>
 #include <fcntl.h>
-#include <sys/ioctl.h>
-#include "network.h"
-#include "debug.h"
 #include "signals.h"
 #include "sys_info.h"
 #include "user_mgmt.h"
-#include "gservice_parser.hpp"
 #include "gservice_manager.hpp"
 
 ginit::GServiceManager service_manager;
+volatile sig_atomic_t g_child_event = 0;
+
+constexpr const char* AVAILABLE_SERVICES_DIR = "/usr/lib/ginit/services";
+constexpr const char* SYSTEM_SERVICES_DIR = "/etc/ginit/services/system";
+constexpr const char* VENDOR_BOOT_SERVICES_PATH = "/usr/lib/ginit/boot-services.conf";
+constexpr const char* ADMIN_BOOT_SERVICES_PATH = "/etc/ginit/boot-services.conf";
 
 void safe_mkdir(const char* dir);
+std::string trim_copy_local(const std::string& value);
+
+struct ConfigIssue {
+    std::string severity;
+    std::string message;
+};
+
+struct LocalServiceInfo {
+    ginit::GService config;
+    std::string source_path;
+    bool persistent_enabled = false;
+    bool preset_enabled = false;
+};
+
+bool string_starts_with_local(const std::string& value, const std::string& prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool response_indicates_failure(const std::string& response) {
+    return string_starts_with_local(response, "Error:") ||
+           string_starts_with_local(response, "Failed") ||
+           string_starts_with_local(response, "Unknown command") ||
+           response.find(" not found.\n") != std::string::npos;
+}
+
+void add_issue(std::vector<ConfigIssue>& issues, const char* severity, const std::string& message) {
+    issues.push_back({severity, message});
+}
+
+std::string join_strings_local(const std::vector<std::string>& values) {
+    std::string out;
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) {
+            out += ", ";
+        }
+        out += values[index];
+    }
+    return out;
+}
+
+bool has_gservice_suffix(const std::string& filename) {
+    return filename.size() > 9 && filename.substr(filename.size() - 9) == ".gservice";
+}
+
+bool is_valid_service_ref(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    for (unsigned char ch : name) {
+        if (!(std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '@')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool load_boot_preset_file(const std::string& path, std::set<std::string>& presets, std::vector<ConfigIssue>* issues) {
+    if (access(path.c_str(), F_OK) != 0) {
+        return true;
+    }
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        if (issues) {
+            add_issue(*issues, "ERR", "Could not open boot preset file " + path);
+        }
+        return false;
+    }
+
+    std::string line;
+    size_t line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        std::string trimmed = trim_copy_local(line);
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+
+        bool remove = false;
+        if (trimmed[0] == '-') {
+            remove = true;
+            trimmed = trim_copy_local(trimmed.substr(1));
+        }
+
+        if (!is_valid_service_ref(trimmed)) {
+            if (issues) {
+                add_issue(
+                    *issues,
+                    "ERR",
+                    path + ":" + std::to_string(line_number) + ": invalid service name '" + trimmed + "'"
+                );
+            }
+            continue;
+        }
+
+        if (remove) {
+            presets.erase(trimmed);
+        } else {
+            presets.insert(trimmed);
+        }
+    }
+
+    return true;
+}
+
+void scan_service_dir(
+    const std::string& dir,
+    bool persistent_enabled,
+    std::map<std::string, LocalServiceInfo>& services,
+    std::vector<ConfigIssue>& issues
+) {
+    DIR* directory = opendir(dir.c_str());
+    if (!directory) {
+        if (errno != ENOENT) {
+            add_issue(issues, "ERR", "Could not open service directory " + dir + ": " + std::strerror(errno));
+        }
+        return;
+    }
+
+    std::vector<std::string> filenames;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(directory)) != nullptr) {
+        const std::string filename = entry->d_name;
+        if (filename.empty() || filename[0] == '.' || !has_gservice_suffix(filename)) {
+            continue;
+        }
+        filenames.push_back(filename);
+    }
+    closedir(directory);
+
+    std::sort(filenames.begin(), filenames.end());
+    for (const auto& filename : filenames) {
+        const std::string path = dir + "/" + filename;
+        std::string error;
+        std::optional<ginit::GService> parsed = ginit::GServiceParser::parse_file(path, &error);
+        if (!parsed) {
+            add_issue(issues, "ERR", path + ": " + error);
+            continue;
+        }
+
+        LocalServiceInfo& slot = services[parsed->name];
+        if (!slot.source_path.empty() && slot.source_path != path && !persistent_enabled) {
+            add_issue(
+                issues,
+                "WARN",
+                "Service '" + parsed->name + "' is declared more than once; keeping " + slot.source_path
+            );
+            continue;
+        }
+
+        slot.config = std::move(*parsed);
+        if (persistent_enabled || slot.source_path.empty()) {
+            slot.source_path = path;
+        }
+        slot.persistent_enabled = slot.persistent_enabled || persistent_enabled;
+    }
+}
+
+std::set<std::string> load_boot_presets(std::vector<ConfigIssue>& issues) {
+    std::set<std::string> presets;
+    load_boot_preset_file(VENDOR_BOOT_SERVICES_PATH, presets, &issues);
+    load_boot_preset_file(ADMIN_BOOT_SERVICES_PATH, presets, &issues);
+    return presets;
+}
+
+std::map<std::string, LocalServiceInfo> load_local_service_catalog(std::vector<ConfigIssue>& issues) {
+    std::map<std::string, LocalServiceInfo> services;
+    scan_service_dir(AVAILABLE_SERVICES_DIR, false, services, issues);
+    scan_service_dir(SYSTEM_SERVICES_DIR, true, services, issues);
+
+    const std::set<std::string> presets = load_boot_presets(issues);
+    for (const auto& name : presets) {
+        auto it = services.find(name);
+        if (it == services.end()) {
+            add_issue(issues, "ERR", "Boot preset references unknown service '" + name + "'");
+            continue;
+        }
+        it->second.preset_enabled = true;
+    }
+
+    return services;
+}
+
+void validate_service_relationships(
+    const LocalServiceInfo& service,
+    const std::map<std::string, LocalServiceInfo>& services,
+    std::vector<ConfigIssue>& issues
+) {
+    for (const auto& dependency : service.config.required_services) {
+        if (services.find(dependency) == services.end()) {
+            add_issue(
+                issues,
+                "ERR",
+                "Service '" + service.config.name + "' requires missing service '" + dependency + "'"
+            );
+        }
+    }
+
+    for (const auto& dependency : service.config.after) {
+        if (services.find(dependency) == services.end()) {
+            add_issue(
+                issues,
+                "WARN",
+                "Service '" + service.config.name + "' orders after missing service '" + dependency + "'"
+            );
+        }
+    }
+
+    for (const auto& dependency : service.config.wants) {
+        if (services.find(dependency) == services.end()) {
+            add_issue(
+                issues,
+                "WARN",
+                "Service '" + service.config.name + "' wants missing service '" + dependency + "'"
+            );
+        }
+    }
+
+    if (!service.config.env_file.empty() && access(service.config.env_file.c_str(), F_OK) != 0) {
+        add_issue(
+            issues,
+            "WARN",
+            "Service '" + service.config.name + "' references missing env file " + service.config.env_file
+        );
+    }
+}
+
+std::string render_offline_service_details(const LocalServiceInfo& service) {
+    std::string out;
+    out += "Service: " + service.config.name + "\n";
+    out += "  Status: Unknown (offline inspection)\n";
+    out += "  Enabled: ";
+    out += (service.persistent_enabled || service.preset_enabled) ? "Yes\n" : "No\n";
+    out += "  Persistent: ";
+    out += service.persistent_enabled ? "Yes\n" : "No\n";
+    out += "  Boot preset: ";
+    out += service.preset_enabled ? "Yes\n" : "No\n";
+    out += "  Description: " + service.config.description + "\n";
+    if (!service.source_path.empty()) {
+        out += "  Source: " + service.source_path + "\n";
+    }
+    out += "  Type: ";
+    out += service.config.type == ginit::ServiceType::Oneshot ? "oneshot\n" : "simple\n";
+    out += "  Restart policy: ";
+    if (service.config.restart_policy == ginit::RestartPolicy::Always) {
+        out += "always\n";
+    } else if (service.config.restart_policy == ginit::RestartPolicy::OnFailure) {
+        out += "on-failure\n";
+    } else {
+        out += "never\n";
+    }
+    if (service.config.restart_delay_us > 0) {
+        out += "  Restart delay: " + std::to_string(service.config.restart_delay_us / 1000U) + " ms\n";
+    }
+    out += "  Stop timeout: " + std::to_string(service.config.stop_timeout_ms) + " ms\n";
+    if (!service.config.user.empty()) {
+        out += "  User: " + service.config.user + "\n";
+    }
+    if (!service.config.group.empty()) {
+        out += "  Group: " + service.config.group + "\n";
+    }
+    if (!service.config.work_dir.empty()) {
+        out += "  Work dir: " + service.config.work_dir + "\n";
+    }
+    if (!service.config.env_file.empty()) {
+        out += "  Env file: " + service.config.env_file + "\n";
+    }
+    if (!service.config.after.empty()) {
+        out += "  After: " + join_strings_local(service.config.after) + "\n";
+    }
+    if (!service.config.required_services.empty()) {
+        out += "  Requires: " + join_strings_local(service.config.required_services) + "\n";
+    }
+    if (!service.config.wants.empty()) {
+        out += "  Wants: " + join_strings_local(service.config.wants) + "\n";
+    }
+    out += "  Log file: /var/log/ginit/" + service.config.name + ".log\n";
+    if (!service.config.start_pre.empty()) {
+        out += "  StartPre: " + service.config.start_pre + "\n";
+    }
+    out += "  Start: " + service.config.start + "\n";
+    if (!service.config.stop.empty()) {
+        out += "  Stop: " + service.config.stop + "\n";
+    }
+    return out;
+}
+
+bool print_local_service_details(const std::string& service_name) {
+    std::vector<ConfigIssue> issues;
+    const std::map<std::string, LocalServiceInfo> services = load_local_service_catalog(issues);
+    for (const auto& issue : issues) {
+        if (issue.severity == "ERR") {
+            std::cerr << "[" << issue.severity << "] " << issue.message << std::endl;
+        }
+    }
+
+    auto it = services.find(service_name);
+    if (it == services.end()) {
+        std::cerr << "Service '" << service_name << "' not found." << std::endl;
+        return false;
+    }
+
+    std::cout << render_offline_service_details(it->second);
+    return true;
+}
+
+bool run_local_configuration_check(const std::string& service_name) {
+    std::vector<ConfigIssue> issues;
+    const std::map<std::string, LocalServiceInfo> services = load_local_service_catalog(issues);
+
+    size_t checked_services = 0;
+    if (!service_name.empty()) {
+        auto it = services.find(service_name);
+        if (it == services.end()) {
+            add_issue(issues, "ERR", "Service '" + service_name + "' not found.");
+        } else {
+            validate_service_relationships(it->second, services, issues);
+            checked_services = 1;
+        }
+    } else {
+        for (const auto& entry : services) {
+            validate_service_relationships(entry.second, services, issues);
+        }
+        checked_services = services.size();
+    }
+
+    std::set<std::string> presets;
+    load_boot_preset_file(VENDOR_BOOT_SERVICES_PATH, presets, nullptr);
+    load_boot_preset_file(ADMIN_BOOT_SERVICES_PATH, presets, nullptr);
+
+    size_t error_count = 0;
+    size_t warning_count = 0;
+    for (const auto& issue : issues) {
+        if (issue.severity == "ERR") {
+            ++error_count;
+        } else if (issue.severity == "WARN") {
+            ++warning_count;
+        }
+    }
+
+    std::cout << "ginit configuration check:" << std::endl;
+    std::cout << "  [OK] loaded " << services.size() << " service definition(s)" << std::endl;
+    std::cout << "  [OK] merged " << presets.size() << " boot preset entries" << std::endl;
+    if (!service_name.empty() && checked_services == 1) {
+        std::cout << "  [OK] checked service '" << service_name << "'" << std::endl;
+    } else {
+        std::cout << "  [OK] checked " << checked_services << " service(s)" << std::endl;
+    }
+
+    for (const auto& issue : issues) {
+        if (issue.severity == "ERR") {
+            std::cout << "  [ERR] " << issue.message << std::endl;
+        } else if (issue.severity == "WARN") {
+            std::cout << "  [WARN] " << issue.message << std::endl;
+        }
+    }
+
+    if (error_count == 0 && warning_count == 0) {
+        std::cout << "Summary: configuration looks good" << std::endl;
+    } else if (error_count == 0) {
+        std::cout << "Summary: warnings detected (" << warning_count << " warning(s))" << std::endl;
+    } else {
+        std::cout << "Summary: problems detected (" << error_count << " error(s), "
+                  << warning_count << " warning(s))" << std::endl;
+    }
+    return error_count == 0;
+}
+
+void apply_boot_presets(ginit::GServiceManager& manager) {
+    std::vector<ConfigIssue> issues;
+    const std::set<std::string> presets = load_boot_presets(issues);
+
+    for (const auto& issue : issues) {
+        std::cerr << "[GINIT] [" << issue.severity << "] " << issue.message << std::endl;
+    }
+
+    for (const auto& preset : presets) {
+        const std::string result = manager.preset_service(preset);
+        if (response_indicates_failure(result)) {
+            std::cerr << "[GINIT] " << trim_copy_local(result) << std::endl;
+        }
+    }
+}
 
 std::string trim_copy_local(const std::string& value) {
     size_t first = value.find_first_not_of(" \t\r\n");
@@ -352,22 +739,121 @@ void generate_os_release() {
     }
 }
 
-// Map to track TTY Supervisor PIDs: PID -> TTY Device Path
-std::map<pid_t, std::string> g_tty_pids;
+struct TtySupervisor {
+    const char* tty = nullptr;
+    pid_t pid = -1;
+};
 
-pid_t spawn_getty(const std::string& tty, const std::string& autologin_user = "") {
+bool install_signal_handler(int sig, void (*handler)(int)) {
+    struct sigaction action {};
+    action.sa_handler = handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    if (sigaction(sig, &action, nullptr) != 0) {
+        perror(("[GINIT] sigaction failed for signal " + std::to_string(sig)).c_str());
+        return false;
+    }
+    return true;
+}
+
+void pid1_signal_handler(int sig) {
+    if (sig == SIGCHLD) {
+        g_child_event = 1;
+        return;
+    }
+    g_stop_sig = sig;
+}
+
+[[noreturn]] void handle_shutdown_signal() {
+    if (g_stop_sig == SIGINT) {
+        std::cerr << "[GINIT] Rebooting..." << std::endl;
+        sync();
+        reboot(RB_AUTOBOOT);
+    }
+
+    std::cerr << "[GINIT] Powering off..." << std::endl;
+    sync();
+    reboot(RB_POWER_OFF);
+    _exit(1);
+}
+
+bool ensure_symlink(const char* target, const char* linkpath) {
+    if (symlink(target, linkpath) == 0 || errno == EEXIST) {
+        return true;
+    }
+    perror(("[GINIT] Failed to create symlink " + std::string(linkpath)).c_str());
+    return false;
+}
+
+pid_t spawn_getty(const char* tty, const char* autologin_user = nullptr) {
     pid_t pid = fork();
+    if (pid < 0) {
+        perror(("[GINIT] fork failed while spawning getty for " + std::string(tty)).c_str());
+        return -1;
+    }
+
     if (pid == 0) {
-        // Child: Exec getty
-        if (!autologin_user.empty()) {
-             execl("/sbin/getty", "getty", tty.c_str(), autologin_user.c_str(), nullptr);
+        if (autologin_user && *autologin_user) {
+            execl("/sbin/getty", "getty", tty, autologin_user, nullptr);
         } else {
-             execl("/sbin/getty", "getty", tty.c_str(), nullptr);
+            execl("/sbin/getty", "getty", tty, nullptr);
         }
         perror("execv /sbin/getty");
-        exit(1);
+        _exit(127);
     }
+
     return pid;
+}
+
+void ensure_tty_running(TtySupervisor& tty, bool is_live) {
+    if (tty.pid > 0) {
+        return;
+    }
+
+    tty.pid = spawn_getty(tty.tty, is_live ? "root" : nullptr);
+    if (tty.pid <= 0) {
+        std::cerr << "[GINIT] Failed to spawn getty for " << tty.tty << std::endl;
+    }
+}
+
+bool handle_tty_exit(pid_t pid, std::array<TtySupervisor, 4>& terminals, bool is_live) {
+    for (auto& tty : terminals) {
+        if (tty.pid != pid) {
+            continue;
+        }
+
+        tty.pid = -1;
+        ensure_tty_running(tty, is_live);
+        return true;
+    }
+    return false;
+}
+
+void reap_children(std::array<TtySupervisor, 4>& terminals, bool is_live) {
+    while (true) {
+        int status = 0;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            if (service_manager.is_managed_process(pid)) {
+                service_manager.handle_process_death(pid, status);
+            } else if (!handle_tty_exit(pid, terminals, is_live)) {
+                std::cerr << "[GINIT] Reaped untracked child PID " << pid << std::endl;
+            }
+            continue;
+        }
+
+        if (pid == 0) {
+            return;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != ECHILD) {
+            perror("[GINIT] waitpid");
+        }
+        return;
+    }
 }
 
 void show_help() {
@@ -375,6 +861,8 @@ void show_help() {
     std::cout << "Usage: ginit <command> [service]" << std::endl;
     std::cout << "\nCommands:" << std::endl;
     std::cout << "  status [service]   Show status of all services or a specific one" << std::endl;
+    std::cout << "  show <service>     Show detailed service configuration and boot policy" << std::endl;
+    std::cout << "  check [service]    Validate service files and boot preset configuration" << std::endl;
     std::cout << "  start <service>    Start a service" << std::endl;
     std::cout << "  stop <service>     Stop a service" << std::endl;
     std::cout << "  restart <service>  Restart a service" << std::endl;
@@ -383,27 +871,19 @@ void show_help() {
     std::cout << "  help               Show this help message" << std::endl;
 }
 
-void handle_signal(int sig) {
-    if (sig == SIGINT) {
-        std::cerr << "[GINIT] Rebooting..." << std::endl;
-        sync();
-        reboot(RB_AUTOBOOT);
-    } else if (sig == SIGTERM || sig == SIGPWR) {
-        std::cerr << "[GINIT] Powering off..." << std::endl;
-        sync();
-        reboot(RB_POWER_OFF);
-    }
-}
-
 int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
     if (getpid() == 1) {
-        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/bin/apps/system:/bin/apps", 1);
-        signal(SIGINT, handle_signal);
-        signal(SIGTERM, handle_signal);
-        signal(SIGPWR, handle_signal);
+        if (setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/bin/apps/system:/bin/apps", 1) != 0) {
+            perror("[GINIT] setenv(PATH)");
+        }
+        install_signal_handler(SIGINT, pid1_signal_handler);
+        install_signal_handler(SIGTERM, pid1_signal_handler);
+        install_signal_handler(SIGPWR, pid1_signal_handler);
+        install_signal_handler(SIGCHLD, pid1_signal_handler);
+        signal(SIGPIPE, SIG_IGN);
     }
 
     if (getpid() != 1) {
@@ -421,7 +901,7 @@ int main(int argc, char* argv[]) {
         std::string service = (argc > 2) ? argv[2] : "";
         
         // Commands that REQUIRE a service name
-        if (cmd == "start" || cmd == "stop" || cmd == "restart" || cmd == "enable" || cmd == "disable") {
+        if (cmd == "start" || cmd == "stop" || cmd == "restart" || cmd == "enable" || cmd == "disable" || cmd == "show") {
             if (service.empty()) {
                 std::cerr << "Error: Command '" << cmd << "' requires a service name." << std::endl;
                 std::cerr << "Usage: ginit " << cmd << " <service>" << std::endl;
@@ -429,13 +909,34 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (cmd == "status" || cmd == "start" || cmd == "stop" || cmd == "restart" || cmd == "enable" || cmd == "disable") {
-            ginit::GServiceManager::send_command(cmd + " " + service);
-            return 0;
+        if (cmd == "check") {
+            return run_local_configuration_check(service) ? 0 : 1;
         }
 
-        if (cmd == "--configure-network") {
-            return ConfigureNetwork();
+        if (cmd == "show") {
+            std::string response;
+            std::string error;
+            if (ginit::GServiceManager::send_command(cmd + " " + service, &response, &error)) {
+                std::cout << response;
+                return response_indicates_failure(response) ? 1 : 0;
+            }
+            if (!error.empty()) {
+                std::cerr << error << std::endl;
+            }
+            return print_local_service_details(service) ? 0 : 1;
+        }
+
+        if (cmd == "status" || cmd == "start" || cmd == "stop" || cmd == "restart" || cmd == "enable" || cmd == "disable") {
+            std::string response;
+            std::string error;
+            if (!ginit::GServiceManager::send_command(cmd + " " + service, &response, &error)) {
+                if (!error.empty()) {
+                    std::cerr << error << std::endl;
+                }
+                return 1;
+            }
+            std::cout << response;
+            return response_indicates_failure(response) ? 1 : 0;
         }
 
         std::cerr << "Unknown command: " << cmd << std::endl;
@@ -446,115 +947,104 @@ int main(int argc, char* argv[]) {
     std::cout << "\033[2J\033[1;1H";
     std::cout << "Welcome to " << runtime_pretty_name() << std::endl;
     
-mount_fs("none", "/proc", "proc");
-mount_fs("none", "/sys", "sysfs");
-mount_fs("devtmpfs", "/dev", "devtmpfs");
-mount_fs("devpts", "/dev/pts", "devpts");
-mount_fs("tmpfs", "/dev/shm", "tmpfs");
-mount_fs("tmpfs", "/tmp", "tmpfs");
-mount_fs("tmpfs", "/run", "tmpfs");
-mount_fs("tmpfs", "/var/log", "tmpfs");
-mount_fs("tmpfs", "/var/tmp", "tmpfs");
-mount_fs("tmpfs", "/usr/share/X11/xkb/compiled", "tmpfs");
+    mount_fs("none", "/proc", "proc");
+    mount_fs("none", "/sys", "sysfs");
+    mount_fs("devtmpfs", "/dev", "devtmpfs");
+    mount_fs("devpts", "/dev/pts", "devpts");
+    mount_fs("tmpfs", "/dev/shm", "tmpfs");
+    mount_fs("tmpfs", "/tmp", "tmpfs");
+    mount_fs("tmpfs", "/run", "tmpfs");
+    mount_fs("tmpfs", "/var/log", "tmpfs");
+    mount_fs("tmpfs", "/var/tmp", "tmpfs");
+    mount_fs("tmpfs", "/usr/share/X11/xkb/compiled", "tmpfs");
 
-ensure_fhs();
+    ensure_fhs();
 
-mkdir("/var/lib/dbus", 0755);
-mkdir("/run/dbus", 0755);
+    safe_mkdir("/var/lib/dbus");
+    safe_mkdir("/run/dbus");
 
-symlink("/proc/self/fd", "/dev/fd");
-symlink("/proc/self/fd/0", "/dev/stdin");
-symlink("/proc/self/fd/1", "/dev/stdout");
-symlink("/proc/self/fd/2", "/dev/stderr");
+    ensure_symlink("/proc/self/fd", "/dev/fd");
+    ensure_symlink("/proc/self/fd/0", "/dev/stdin");
+    ensure_symlink("/proc/self/fd/1", "/dev/stdout");
+    ensure_symlink("/proc/self/fd/2", "/dev/stderr");
 
-UserMgmt::initialize_defaults();
-generate_os_release();
+    UserMgmt::initialize_defaults();
+    generate_os_release();
 
-// Ensure service directories exist
-safe_mkdir("/etc/ginit");
-safe_mkdir("/etc/ginit/services");
-safe_mkdir("/etc/ginit/services/system");
-safe_mkdir("/usr/lib/ginit");
-safe_mkdir("/usr/lib/ginit/services");
-safe_mkdir("/run/systemd");
-safe_mkdir("/run/systemd/inhibit");
-safe_mkdir("/run/systemd/seats");
-safe_mkdir("/run/systemd/sessions");
-safe_mkdir("/run/systemd/users");
-safe_mkdir("/run/user");
-safe_mkdir("/var/lib/elogind");
+    safe_mkdir("/etc/ginit");
+    safe_mkdir("/etc/ginit/services");
+    safe_mkdir("/etc/ginit/services/system");
+    safe_mkdir("/usr/lib/ginit");
+    safe_mkdir("/usr/lib/ginit/services");
+    safe_mkdir("/run/systemd");
+    safe_mkdir("/run/systemd/inhibit");
+    safe_mkdir("/run/systemd/seats");
+    safe_mkdir("/run/systemd/sessions");
+    safe_mkdir("/run/systemd/users");
+    safe_mkdir("/run/user");
+    safe_mkdir("/var/lib/elogind");
 
-configure_selinux_runtime();
+    configure_selinux_runtime();
 
-// Copy default services to system directory if not present
-// This is a bit of a hack for first boot, but okay for now.
-// In a real OS, this would be handled by the package manager.
+    std::cerr << "[GINIT] Loading enabled system services..." << std::endl;
+    service_manager.load_services_from_dir(SYSTEM_SERVICES_DIR, true);
 
-std::cerr << "[GINIT] Loading system services..." << std::endl;
-service_manager.load_services_from_dir("/usr/lib/ginit/services");
-service_manager.load_services_from_dir("/etc/ginit/services/system");
+    std::cerr << "[GINIT] Applying boot presets..." << std::endl;
+    apply_boot_presets(service_manager);
 
-// Explicitly enable core services for boot
-service_manager.enable_service("udevd");
-service_manager.enable_service("udev-trigger");
-service_manager.enable_service("udev-settle");
-service_manager.enable_service("fuse-device");
-service_manager.enable_service("network");
-service_manager.enable_service("dbus");
-service_manager.enable_service("elogind");
-
-std::cerr << "[GINIT] Starting system services..." << std::endl;
-service_manager.start_enabled_services();
-service_manager.run_ipc_server();
-
-std::vector<std::string> terminals = {"/dev/tty1", "/dev/tty2", "/dev/tty3", "/dev/ttyS0"};
-
-// Check if we are in Live Environment
-bool is_live = (access("/etc/geminios-live", F_OK) == 0);
-
-for (const auto& tty : terminals) {
-    pid_t pid;
-    if (is_live) {
-         // Autologin as root on all terminals for Live CD
-         pid = spawn_getty(tty, "root");
-    } else {
-         // Standard Login Prompt for Installed System
-         pid = spawn_getty(tty);
+    std::cerr << "[GINIT] Starting system services..." << std::endl;
+    service_manager.start_enabled_services();
+    if (!service_manager.start_ipc_server()) {
+        std::cerr << "[GINIT] IPC server could not be started; CLI control will be unavailable." << std::endl;
     }
 
-    if (pid > 0) {
-        g_tty_pids[pid] = tty;
+    std::array<TtySupervisor, 4> terminals = {{
+        {"/dev/tty1", -1},
+        {"/dev/tty2", -1},
+        {"/dev/tty3", -1},
+        {"/dev/ttyS0", -1},
+    }};
+
+    const bool is_live = (access("/etc/geminios-live", F_OK) == 0);
+    for (auto& tty : terminals) {
+        ensure_tty_running(tty, is_live);
     }
-}
 
-// Supervisor Loop: Reap and respawn processes
-while (true) {
-    int status;
-    pid_t pid = wait(&status);
+    while (true) {
+        if (g_stop_sig) {
+            handle_shutdown_signal();
+        }
 
-    if (pid > 0) {
-        if (service_manager.is_managed_process(pid)) {
-            service_manager.handle_process_death(pid, status);
-        } else {
-            auto it = g_tty_pids.find(pid);
-            if (it != g_tty_pids.end()) {
-                std::string tty = it->second;
-                g_tty_pids.erase(it);
-                
-                // std::cerr << "[GINIT] TTY " << tty << " respawning..." << std::endl;
-                
-                pid_t new_pid;
-                if (is_live) {
-                    new_pid = spawn_getty(tty, "root");
-                } else {
-                    new_pid = spawn_getty(tty);
-                }
+        reap_children(terminals, is_live);
+        g_child_event = 0;
 
-                if (new_pid > 0) {
-                    g_tty_pids[new_pid] = tty;
-                }
+        const int server_fd = service_manager.ipc_server_fd();
+        if (server_fd < 0) {
+            pause();
+            continue;
+        }
+
+        struct pollfd pfd {};
+        pfd.fd = server_fd;
+        pfd.events = POLLIN;
+
+        int rc = poll(&pfd, 1, -1);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
             }
+            perror("[GINIT] poll");
+            sleep(1);
+            continue;
+        }
+
+        if (pfd.revents & POLLIN) {
+            service_manager.accept_pending_ipc_clients();
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            std::cerr << "[GINIT] Restarting IPC server after socket error." << std::endl;
+            service_manager.shutdown_ipc_server();
+            service_manager.start_ipc_server();
         }
     }
-}
 }

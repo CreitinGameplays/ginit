@@ -1,134 +1,127 @@
 #ifndef GSERVICE_PARSER_HPP
 #define GSERVICE_PARSER_HPP
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
-#include <map>
-#include <memory>
 
 namespace ginit {
 
-struct Meta {
-    std::string description;
-    std::string docs;
-    struct Deps {
-        std::vector<std::string> after;
-        std::vector<std::string> wants;
-        std::vector<std::string> requires;
-    } deps;
+enum class ServiceType : uint8_t {
+    Simple,
+    Oneshot,
 };
 
-struct Process {
-    std::string type;
-    std::string user;
-    std::string group;
-    std::string work_dir;
-    struct Commands {
-        std::string start_pre;
-        std::string start;
-        std::string reload;
-        std::string stop;
-    } commands;
-    struct Lifecycle {
-        std::string restart_policy;
-        std::string restart_delay;
-        std::string stop_timeout;
-    } lifecycle;
+enum class RestartPolicy : uint8_t {
+    Never,
+    OnFailure,
+    Always,
 };
 
-struct Env {
-    std::string load_file;
-    std::map<std::string, std::string> vars;
-};
-
-struct Security {
-    bool no_new_privileges = false;
-    std::string protect_system;
-    bool protect_home = false;
-    bool private_tmp = false;
-    std::vector<std::string> rw_paths;
-};
-
-struct Resources {
-    int ulimit_nofile = 0;
-    std::string memory_max;
-    std::string cpu_quota;
-};
-
-struct Install {
-    std::vector<std::string> wanted_by;
-    std::string alias;
+struct EnvVar {
+    std::string name;
+    std::string value;
 };
 
 struct GService {
     std::string name;
-    Meta meta;
-    Process process;
-    Env env;
-    Security security;
-    Resources resources;
-    Install install;
+    std::string description;
+    std::vector<std::string> after;
+    std::vector<std::string> wants;
+    std::vector<std::string> required_services;
+    std::string user;
+    std::string group;
+    std::string work_dir;
+    std::string env_file;
+    std::vector<EnvVar> env_vars;
+    std::string start_pre;
+    std::string start;
+    std::string stop;
+    bool no_new_privileges = false;
+    ServiceType type = ServiceType::Simple;
+    RestartPolicy restart_policy = RestartPolicy::Never;
+    uint32_t restart_delay_us = 0;
+    uint32_t stop_timeout_ms = 5000;
 };
 
 class GServiceParser {
 public:
-    static std::unique_ptr<GService> parse_file(const std::string& filename);
-    static std::unique_ptr<GService> parse_string(const std::string& content);
+    static std::optional<GService> parse_file(const std::string& filename, std::string* error = nullptr);
+    static std::optional<GService> parse_string(const std::string& content, std::string* error = nullptr);
 
-private:
     struct Token {
         enum Type {
-            IDENTIFIER,
-            STRING,
-            NUMBER,
-            LBRACE,
-            RBRACE,
-            LBRACKET,
-            RBRACKET,
-            EQUALS,
-            COMMA,
-            END_OF_FILE,
-            ERROR
-        } type;
+            Identifier,
+            String,
+            Number,
+            LBrace,
+            RBrace,
+            LBracket,
+            RBracket,
+            Equals,
+            Comma,
+            EndOfFile,
+            Error,
+        } type = EndOfFile;
+
         std::string value;
+        size_t line = 1;
+        size_t column = 1;
     };
 
+private:
     class Lexer {
     public:
-        Lexer(const std::string& input);
+        explicit Lexer(const std::string& input);
         Token next_token();
+
     private:
-        std::string input;
-        size_t pos = 0;
+        const std::string& input_;
+        size_t pos_ = 0;
+        size_t line_ = 1;
+        size_t column_ = 1;
+
+        char peek(size_t offset = 0) const;
+        char advance();
         void skip_whitespace_and_comments();
     };
 
     class Parser {
     public:
-        Parser(Lexer& lexer);
-        std::unique_ptr<GService> parse();
+        explicit Parser(Lexer& lexer);
+        std::optional<GService> parse();
+        const std::string& error_message() const;
+
     private:
-        Lexer& lexer;
-        Token current_token;
+        Lexer& lexer_;
+        Token current_token_;
+        std::string error_;
 
         void next_token();
-        bool match(Token::Type type);
-        bool expect(Token::Type type);
-
-        void parse_service(GService& service);
-        void parse_meta(Meta& meta);
-        void parse_deps(Meta::Deps& deps);
-        void parse_process(Process& process);
-        void parse_commands(Process::Commands& commands);
-        void parse_lifecycle(Process::Lifecycle& lifecycle);
-        void parse_env(Env& env);
-        void parse_vars(std::map<std::string, std::string>& vars);
-        void parse_security(Security& security);
-        void parse_resources(Resources& resources);
-        void parse_install(Install& install);
-
-        std::vector<std::string> parse_string_list();
-        std::string parse_value();
+        bool expect(Token::Type type, const char* expected);
+        bool expect_identifier(const char* expected);
+        bool parse_service(GService& service);
+        bool parse_meta(GService& service);
+        bool parse_deps(GService& service);
+        bool parse_process(GService& service);
+        bool parse_commands(GService& service);
+        bool parse_lifecycle(GService& service);
+        bool parse_env(GService& service);
+        bool parse_vars(GService& service);
+        bool parse_security(GService& service);
+        bool parse_install();
+        bool parse_resources();
+        bool parse_string_list(std::vector<std::string>& values);
+        bool parse_value(std::string& value);
+        bool skip_value();
+        bool skip_block();
+        bool skip_list();
+        bool parse_bool_value(bool& out);
+        bool parse_duration_us(uint32_t& out);
+        bool parse_duration_ms(uint32_t& out);
+        void set_error(const std::string& message);
+        std::string location_prefix() const;
     };
 };
 

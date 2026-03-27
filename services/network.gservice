@@ -10,7 +10,7 @@ service "network" {
     process {
         type = "oneshot"
         commands {
-            start = "/bin/ginit --configure-network"
+            start = "/bin/ginit-netcfg"
         }
     }
 }

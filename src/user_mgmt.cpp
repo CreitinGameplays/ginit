@@ -201,35 +201,3 @@ bool UserMgmt::is_valid_username(const std::string& username) {
     }
     return true;
 }
-
-void UserMgmt::initialize_defaults() {
-    if (access("/etc/passwd", F_OK) != 0) {
-        std::cout << "[INIT] Creating default /etc/passwd..." << std::endl;
-        std::ofstream p("/etc/passwd");
-        // Root Account
-        p << "root:x:0:0:System Administrator:/root:/bin/bash\n";
-        p.close();
-    }
-    
-    if (access("/etc/shadow", F_OK) != 0) {
-        std::cout << "[INIT] Creating default /etc/shadow..." << std::endl;
-        std::ofstream s("/etc/shadow");
-        // Root password 'root'
-        s << "root:" << hash_password("root") << ":19000:0:99999:7:::" << "\n";
-        s.close();
-        chmod("/etc/shadow", 0600);
-    }
-
-    if (access("/etc/group", F_OK) != 0) {
-        std::cout << "[INIT] Creating default /etc/group..." << std::endl;
-        std::ofstream g("/etc/group");
-        g << "root:x:0:\n";
-        g << "sudo:x:27:root\n"; // Add root to sudo
-        g << "users:x:100:\n";
-        g.close();
-    }
-    
-    // Ensure home exists
-    mkdir("/root", 0700);
-    mkdir("/home", 0755);
-}

@@ -1,534 +1,1260 @@
 #include "gservice_manager.hpp"
-#include <iostream>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <cstring>
+
 #include <algorithm>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/stat.h>
-#include <thread>
-#include <sstream>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
-#include <iomanip>
-#include <pwd.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <fstream>
 #include <grp.h>
+#include <poll.h>
+#include <pwd.h>
+#include <sstream>
+#include <string_view>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace ginit {
 
+namespace {
+
+constexpr useconds_t kStopPollIntervalUs = 50000;
+
+void log_with_stream(FILE* stream, const char* level, const std::string& msg) {
+    std::time_t now = std::time(nullptr);
+    struct tm tm_now {};
+    localtime_r(&now, &tm_now);
+
+    char timestamp[16] = {};
+    std::strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &tm_now);
+    if (level) {
+        std::fprintf(stream, "[%s] [%s] %s\n", timestamp, level, msg.c_str());
+    } else {
+        std::fprintf(stream, "[%s] %s\n", timestamp, msg.c_str());
+    }
+    std::fflush(stream);
+}
+
 void log_message(const std::string& msg) {
-    auto now = std::time(nullptr);
-    auto tm = *std::localtime(&now);
-    std::cout << "[" << std::put_time(&tm, "%H:%M:%S") << "] " << msg << std::endl;
+    log_with_stream(stdout, nullptr, msg);
 }
 
 void log_error(const std::string& msg) {
-    auto now = std::time(nullptr);
-    auto tm = *std::localtime(&now);
-    std::cerr << "[" << std::put_time(&tm, "%H:%M:%S") << "] [ERR] " << msg << std::endl;
+    log_with_stream(stderr, "ERR", msg);
 }
 
-// Helper to parse duration strings like "5s", "100ms" into microseconds
-unsigned long parse_duration(const std::string& str) {
-    if (str.empty()) return 0;
-    
-    unsigned long val = 0;
-    std::string unit;
-    
-    size_t i = 0;
-    while (i < str.length() && isdigit(str[i])) {
-        val = val * 10 + (str[i] - '0');
-        i++;
+std::string trim_copy(std::string value) {
+    size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return "";
     }
-    
-    if (i < str.length()) unit = str.substr(i);
-    
-    if (unit == "ms") return val * 1000;
-    if (unit == "s") return val * 1000000;
-    if (unit == "m") return val * 60 * 1000000;
-    if (unit == "h") return val * 3600 * 1000000;
-    
-    // Default to seconds if just a number, or treat as seconds if unknown
-    return val * 1000000;
+    size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
 }
 
-std::string get_socket_path() {
+std::string join_strings(const std::vector<std::string>& values) {
+    std::string out;
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) {
+            out += ", ";
+        }
+        out += values[index];
+    }
+    return out;
+}
+
+bool string_starts_with(std::string_view value, std::string_view prefix) {
+    return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
+}
+
+std::string wait_status_to_string(int status) {
+    if (WIFEXITED(status)) {
+        return "exit " + std::to_string(WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+        return "signal " + std::to_string(WTERMSIG(status));
+    }
+    if (WIFSTOPPED(status)) {
+        return "stopped by signal " + std::to_string(WSTOPSIG(status));
+    }
+    return "status " + std::to_string(status);
+}
+
+bool ensure_directory(const char* path, mode_t mode) {
+    if (mkdir(path, mode) == 0 || errno == EEXIST) {
+        return true;
+    }
+    log_error(std::string("mkdir failed for ") + path + ": " + std::strerror(errno));
+    return false;
+}
+
+bool set_close_on_exec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) {
+        return false;
+    }
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+int open_log_fd(const std::string& log_file) {
+    int fd = open(log_file.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        log_error("Unable to open log file " + log_file + ": " + std::strerror(errno));
+    }
+    return fd;
+}
+
+std::string join_path(const char* base, const std::string& name) {
+    return std::string(base) + "/" + name + ".gservice";
+}
+
+} // namespace
+
+std::string GServiceManager::get_socket_path() {
     const char* env_path = getenv("GINIT_SOCK");
-    if (env_path) return env_path;
+    if (env_path && *env_path) {
+        return env_path;
+    }
     return "/run/ginit.sock";
 }
 
-GServiceManager::GServiceManager() {}
+GServiceManager::GServiceManager() : socket_path_(get_socket_path()) {}
 
-void GServiceManager::load_services_from_dir(const std::string& dir) {
-    DIR* d = opendir(dir.c_str());
-    if (!d) return;
+GServiceManager::~GServiceManager() {
+    shutdown_ipc_server();
+}
 
-    struct dirent* entry;
-    while ((entry = readdir(d)) != nullptr) {
-        std::string filename = entry->d_name;
+bool GServiceManager::is_enabled(const ServiceState& service) {
+    return service.persistent_enabled || service.preset_enabled;
+}
+
+ServiceState* GServiceManager::find_service(const std::string& name) {
+    for (auto& service : services_) {
+        if (service.config.name == name) {
+            return &service;
+        }
+    }
+    return nullptr;
+}
+
+const ServiceState* GServiceManager::find_service(const std::string& name) const {
+    for (const auto& service : services_) {
+        if (service.config.name == name) {
+            return &service;
+        }
+    }
+    return nullptr;
+}
+
+ServiceState* GServiceManager::find_service_by_pid(pid_t pid) {
+    for (auto& service : services_) {
+        if (service.pid == pid) {
+            return &service;
+        }
+    }
+    return nullptr;
+}
+
+std::string GServiceManager::service_log_path(const std::string& service_name) const {
+    return std::string("/var/log/ginit/") + service_name + ".log";
+}
+
+bool GServiceManager::load_service_file(const std::string& path, bool persistent_enabled, ServiceState** out_state) {
+    std::string error;
+    std::optional<GService> config = GServiceParser::parse_file(path, &error);
+    if (!config) {
+        log_error("[GSERVICE] Failed to parse " + path + ": " + error);
+        return false;
+    }
+
+    ServiceState* existing = find_service(config->name);
+    if (existing) {
+        const bool was_running = existing->running;
+        const pid_t previous_pid = existing->pid;
+        const bool was_finished = existing->finished_successfully;
+        const bool was_stopping = existing->stopping;
+        const bool was_starting = existing->starting;
+        const int restart_count = existing->restart_count;
+        const std::string last_result = existing->last_result;
+        const bool preset_enabled = existing->preset_enabled;
+        existing->config = std::move(*config);
+        existing->source_path = path;
+        existing->persistent_enabled = existing->persistent_enabled || persistent_enabled;
+        existing->preset_enabled = preset_enabled;
+        existing->running = was_running;
+        existing->pid = previous_pid;
+        existing->finished_successfully = was_finished;
+        existing->stopping = was_stopping;
+        existing->starting = was_starting;
+        existing->restart_count = restart_count;
+        existing->last_result = last_result;
+        if (out_state) {
+            *out_state = existing;
+        }
+        log_message("[GSERVICE] Reloaded " + existing->config.name + " from " + path);
+        return true;
+    }
+
+    ServiceState state;
+    state.config = std::move(*config);
+    state.source_path = path;
+    state.persistent_enabled = persistent_enabled;
+    services_.push_back(std::move(state));
+    if (out_state) {
+        *out_state = &services_.back();
+    }
+
+    log_message("[GSERVICE] Loaded " + services_.back().config.name + " from " + path);
+    return true;
+}
+
+ServiceState* GServiceManager::load_service_by_name(const std::string& name, bool persistent_enabled) {
+    if (ServiceState* existing = find_service(name)) {
+        existing->persistent_enabled = existing->persistent_enabled || persistent_enabled;
+        return existing;
+    }
+
+    ServiceState* state = nullptr;
+    const std::string system_path = join_path(SYSTEM_SERVICES_DIR, name);
+    if (access(system_path.c_str(), F_OK) == 0 && load_service_file(system_path, true, &state)) {
+        return state;
+    }
+
+    const std::string available_path = join_path(AVAILABLE_SERVICES_DIR, name);
+    if (access(available_path.c_str(), F_OK) == 0 && load_service_file(available_path, persistent_enabled, &state)) {
+        return state;
+    }
+
+    return nullptr;
+}
+
+bool GServiceManager::load_service_snapshot(const std::string& name, ServiceState& out_state, std::string* error) const {
+    out_state = {};
+
+    const std::string system_path = join_path(SYSTEM_SERVICES_DIR, name);
+    std::optional<GService> parsed = GServiceParser::parse_file(system_path, error);
+    if (parsed) {
+        out_state.config = std::move(*parsed);
+        out_state.source_path = system_path;
+        out_state.persistent_enabled = true;
+        return true;
+    }
+
+    const std::string available_path = join_path(AVAILABLE_SERVICES_DIR, name);
+    parsed = GServiceParser::parse_file(available_path, error);
+    if (parsed) {
+        out_state.config = std::move(*parsed);
+        out_state.source_path = available_path;
+        return true;
+    }
+
+    return false;
+}
+
+void GServiceManager::load_services_from_dir(const std::string& dir, bool enabled) {
+    DIR* directory = opendir(dir.c_str());
+    if (!directory) {
+        if (errno != ENOENT) {
+            log_error("[GSERVICE] Unable to open " + dir + ": " + std::strerror(errno));
+        }
+        return;
+    }
+
+    std::vector<std::string> filenames;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(directory)) != nullptr) {
+        const std::string filename = entry->d_name;
+        if (string_starts_with(filename, ".")) {
+            continue;
+        }
         if (filename.size() > 9 && filename.substr(filename.size() - 9) == ".gservice") {
-            auto config = GServiceParser::parse_file(dir + "/" + filename);
-            if (config) {
-                std::string name = config->name;
-                services[name].config = std::move(config);
-                services[name].enabled = true; 
-                log_message("[GSERVICE] Loaded " + name + " from " + filename);
+            filenames.push_back(filename);
+        }
+    }
+    closedir(directory);
+
+    std::sort(filenames.begin(), filenames.end());
+    for (const auto& filename : filenames) {
+        load_service_file(dir + "/" + filename, enabled, nullptr);
+    }
+}
+
+bool GServiceManager::apply_environment(const GService& config, std::string* error) {
+    for (const auto& variable : config.env_vars) {
+        if (setenv(variable.name.c_str(), variable.value.c_str(), 1) != 0) {
+            if (error) {
+                *error = "setenv failed for " + variable.name + ": " + std::strerror(errno);
             }
+            return false;
         }
     }
-    closedir(d);
-}
 
-void GServiceManager::setup_environment(const GService& config) {
-    // Set variables from config
-    for (const auto& var : config.env.vars) {
-        setenv(var.first.c_str(), var.second.c_str(), 1);
-    }
-    
-    // Set working directory
-    if (!config.process.work_dir.empty()) {
-        if (chdir(config.process.work_dir.c_str()) != 0) {
-            perror("chdir");
+    if (!config.env_file.empty()) {
+        std::ifstream file(config.env_file);
+        if (!file.is_open()) {
+            if (error) {
+                *error = "unable to open env file " + config.env_file + ": " + std::strerror(errno);
+            }
+            return false;
         }
-    }
-}
 
-void GServiceManager::setup_security(const GService& config) {
-    if (!config.process.user.empty()) {
-        struct passwd* pwd = getpwnam(config.process.user.c_str());
-        if (pwd) {
-            if (setgid(pwd->pw_gid) != 0) perror("setgid");
-            if (initgroups(config.process.user.c_str(), pwd->pw_gid) != 0) perror("initgroups");
-            
-            if (!config.process.group.empty()) {
-                struct group* grp = getgrnam(config.process.group.c_str());
-                if (grp) {
-                     if (setgid(grp->gr_gid) != 0) perror("setgid group");
+        std::string line;
+        size_t line_number = 0;
+        while (std::getline(file, line)) {
+            ++line_number;
+            line = trim_copy(std::move(line));
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            const size_t separator = line.find('=');
+            if (separator == std::string::npos || separator == 0) {
+                if (error) {
+                    *error = "invalid env entry in " + config.env_file + " on line " + std::to_string(line_number);
                 }
+                return false;
             }
-            
-            if (setuid(pwd->pw_uid) != 0) perror("setuid");
-        } else {
-             log_error("[GSERVICE] User " + config.process.user + " not found!");
+
+            std::string name = trim_copy(line.substr(0, separator));
+            std::string value = trim_copy(line.substr(separator + 1));
+            if (name.empty()) {
+                if (error) {
+                    *error = "invalid env entry in " + config.env_file + " on line " + std::to_string(line_number);
+                }
+                return false;
+            }
+            if (setenv(name.c_str(), value.c_str(), 1) != 0) {
+                if (error) {
+                    *error = "setenv failed for " + name + ": " + std::strerror(errno);
+                }
+                return false;
+            }
         }
-    } else if (!config.process.group.empty()) {
-         struct group* grp = getgrnam(config.process.group.c_str());
-         if (grp) {
-             if (setgid(grp->gr_gid) != 0) perror("setgid only");
-         }
     }
 
-    if (config.security.no_new_privileges) {
-        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-            perror("prctl(NO_NEW_PRIVS)");
+    if (!config.work_dir.empty() && chdir(config.work_dir.c_str()) != 0) {
+        if (error) {
+            *error = "chdir(" + config.work_dir + ") failed: " + std::strerror(errno);
         }
+        return false;
     }
+
+    return true;
 }
 
-pid_t GServiceManager::spawn_process(const GService& config) {
-    // Prepare logging
-    std::string log_dir = "/var/log/ginit";
-    mkdir(log_dir.c_str(), 0755);
-    std::string log_file = log_dir + "/" + config.name + ".log";
+bool GServiceManager::apply_security(const GService& config, std::string* error) {
+    gid_t target_gid = static_cast<gid_t>(-1);
+    uid_t target_uid = static_cast<uid_t>(-1);
+    const char* target_user_name = nullptr;
 
-    // Handle start_pre if it exists
-    if (!config.process.commands.start_pre.empty()) {
-        log_message("[GSERVICE] Running start_pre for " + config.name);
-        
-        pid_t pre_pid = fork();
-        if (pre_pid == 0) {
-            // Child for start_pre
-            int log_fd = open(log_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (log_fd >= 0) {
-                dup2(log_fd, STDOUT_FILENO);
-                dup2(log_fd, STDERR_FILENO);
-                close(log_fd);
+    if (!config.user.empty()) {
+        struct passwd* pwd = getpwnam(config.user.c_str());
+        if (!pwd) {
+            if (error) {
+                *error = "user '" + config.user + "' not found";
             }
-            
-            std::string cmd = config.process.commands.start_pre;
-            execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
-            perror("exec start_pre");
-            exit(127);
-        } else if (pre_pid > 0) {
-            int status;
-            waitpid(pre_pid, &status, 0);
-            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                 log_error("[GSERVICE] start_pre failed for " + config.name);
-                 return -1; 
+            return false;
+        }
+        target_uid = pwd->pw_uid;
+        target_gid = pwd->pw_gid;
+        target_user_name = pwd->pw_name;
+    }
+
+    if (!config.group.empty()) {
+        struct group* grp = getgrnam(config.group.c_str());
+        if (!grp) {
+            if (error) {
+                *error = "group '" + config.group + "' not found";
             }
+            return false;
+        }
+        target_gid = grp->gr_gid;
+    }
+
+    if (target_user_name) {
+        if (initgroups(target_user_name, target_gid != static_cast<gid_t>(-1) ? target_gid : 0) != 0) {
+            if (error) {
+                *error = "initgroups failed for user '" + config.user + "': " + std::strerror(errno);
+            }
+            return false;
         }
     }
 
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process
+    if (target_gid != static_cast<gid_t>(-1) && setgid(target_gid) != 0) {
+        if (error) {
+            *error = std::string("setgid failed: ") + std::strerror(errno);
+        }
+        return false;
+    }
 
-        // Redirect Output
-        int log_fd = open(log_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (target_uid != static_cast<uid_t>(-1) && setuid(target_uid) != 0) {
+        if (error) {
+            *error = std::string("setuid failed: ") + std::strerror(errno);
+        }
+        return false;
+    }
+
+    if (config.no_new_privileges && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        if (error) {
+            *error = std::string("prctl(PR_SET_NO_NEW_PRIVS) failed: ") + std::strerror(errno);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+int GServiceManager::run_shell_command(const GService& config, const std::string& command, const std::string& log_file) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_error("[GSERVICE] fork failed for " + config.name + ": " + std::strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        int log_fd = open_log_fd(log_file);
         if (log_fd >= 0) {
             dup2(log_fd, STDOUT_FILENO);
             dup2(log_fd, STDERR_FILENO);
             close(log_fd);
         }
 
-        setup_environment(config);
-        setup_security(config);
-        
-        // Execute start command
-        std::string cmd = config.process.commands.start;
-        execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
-        
-        perror("exec /bin/sh");
-        exit(1);
+        std::string error;
+        if (!apply_environment(config, &error) || !apply_security(config, &error)) {
+            std::fprintf(stderr, "[GSERVICE] %s\n", error.c_str());
+            _exit(126);
+        }
+
+        execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+        std::fprintf(stderr, "[GSERVICE] exec /bin/sh failed for %s: %s\n", config.name.c_str(), std::strerror(errno));
+        _exit(127);
     }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            log_error("[GSERVICE] waitpid failed for " + config.name + ": " + std::strerror(errno));
+            return -1;
+        }
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return -1;
+}
+
+pid_t GServiceManager::spawn_process(const GService& config) {
+    ensure_directory("/var/log", 0755);
+    ensure_directory("/var/log/ginit", 0755);
+    const std::string log_file = service_log_path(config.name);
+
+    if (!config.start_pre.empty()) {
+        log_message("[GSERVICE] Running start_pre for " + config.name);
+        const int pre_status = run_shell_command(config, config.start_pre, log_file);
+        if (pre_status != 0) {
+            log_error("[GSERVICE] start_pre failed for " + config.name + " with " + std::to_string(pre_status));
+            return -1;
+        }
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        log_error("[GSERVICE] fork failed for " + config.name + ": " + std::strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        int log_fd = open_log_fd(log_file);
+        if (log_fd >= 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
+
+        std::string error;
+        if (!apply_environment(config, &error) || !apply_security(config, &error)) {
+            std::fprintf(stderr, "[GSERVICE] %s\n", error.c_str());
+            _exit(126);
+        }
+
+        execl("/bin/sh", "sh", "-c", config.start.c_str(), nullptr);
+        std::fprintf(stderr, "[GSERVICE] exec /bin/sh failed for %s: %s\n", config.name.c_str(), std::strerror(errno));
+        _exit(127);
+    }
+
     return pid;
 }
 
+std::vector<size_t> GServiceManager::get_service_order() const {
+    std::vector<size_t> order;
+    order.reserve(services_.size());
+    std::vector<unsigned char> state(services_.size(), 0);
+    for (size_t index = 0; index < services_.size(); ++index) {
+        if (state[index] == 0) {
+            visit(index, state, order);
+        }
+    }
+    return order;
+}
+
+void GServiceManager::visit(size_t index, std::vector<unsigned char>& state, std::vector<size_t>& order) const {
+    if (state[index] == 2) {
+        return;
+    }
+    if (state[index] == 1) {
+        log_error("[GSERVICE] Dependency cycle detected involving " + services_[index].config.name);
+        return;
+    }
+
+    state[index] = 1;
+    for (const auto& dep_name : services_[index].config.after) {
+        for (size_t dep_index = 0; dep_index < services_.size(); ++dep_index) {
+            if (services_[dep_index].config.name == dep_name) {
+                visit(dep_index, state, order);
+                break;
+            }
+        }
+    }
+
+    state[index] = 2;
+    order.push_back(index);
+}
+
+void GServiceManager::start_enabled_services() {
+    const std::vector<size_t> order = get_service_order();
+    for (size_t index : order) {
+        if (is_enabled(services_[index]) && !services_[index].running) {
+            start_service(services_[index].config.name);
+        }
+    }
+}
+
+std::string GServiceManager::start_service(const std::string& name) {
+    if (name.empty()) {
+        return "Error: Missing service name.\n";
+    }
+
+    ServiceState* service = find_service(name);
+    if (!service) {
+        service = load_service_by_name(name, false);
+    }
+    if (!service) {
+        return "Error: Service '" + name + "' not found.\n";
+    }
+
+    if (service->running) {
+        return "Service '" + name + "' is already running (PID " + std::to_string(service->pid) + ").\n";
+    }
+    if (service->config.type == ServiceType::Oneshot && service->finished_successfully) {
+        return "Oneshot service '" + name + "' has already finished successfully.\n";
+    }
+    if (service->starting) {
+        return "Error: Dependency cycle detected while starting '" + name + "'.\n";
+    }
+
+    service->starting = true;
+    for (const auto& dependency : service->config.required_services) {
+        ServiceState* required = find_service(dependency);
+        if (!required) {
+            required = load_service_by_name(dependency, false);
+        }
+        if (!required) {
+            service->starting = false;
+            return "Failed to load requirement '" + dependency + "' for " + name + ".\n";
+        }
+        if (!required->running && !required->finished_successfully) {
+            log_message("[GSERVICE] Starting requirement " + dependency + " for " + name);
+            const std::string result = start_service(dependency);
+            if (!required->running && !required->finished_successfully) {
+                service->starting = false;
+                return "Failed to start requirement '" + dependency + "' for " + name + ".\n" + result;
+            }
+        }
+    }
+
+    for (const auto& dependency : service->config.wants) {
+        ServiceState* wanted = find_service(dependency);
+        if (!wanted) {
+            wanted = load_service_by_name(dependency, false);
+        }
+        if (wanted && !wanted->running && !wanted->finished_successfully) {
+            log_message("[GSERVICE] Starting wanted dependency " + dependency + " for " + name);
+            start_service(dependency);
+        }
+    }
+
+    log_message("[GSERVICE] Starting " + name + "...");
+    service->finished_successfully = false;
+    service->stopping = false;
+    service->last_result = "starting";
+    service->pid = spawn_process(service->config);
+    if (service->pid <= 0) {
+        service->starting = false;
+        service->pid = -1;
+        service->last_result = "start failed";
+        return "Failed to start " + name + ".\n";
+    }
+
+    if (service->config.type == ServiceType::Oneshot) {
+        int status = 0;
+        while (waitpid(service->pid, &status, 0) < 0) {
+            if (errno != EINTR) {
+                log_error("[GSERVICE] waitpid failed for oneshot " + name + ": " + std::strerror(errno));
+                service->pid = -1;
+                service->starting = false;
+                service->last_result = "waitpid failed";
+                return "Oneshot " + name + " failed.\n";
+            }
+        }
+
+        service->pid = -1;
+        service->running = false;
+        service->starting = false;
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            service->finished_successfully = true;
+            service->last_result = "exit 0";
+            log_message("[GSERVICE] Oneshot " + name + " finished successfully.");
+            return "Oneshot " + name + " finished successfully.\n";
+        }
+
+        service->finished_successfully = false;
+        service->last_result = wait_status_to_string(status);
+        log_error("[GSERVICE] Oneshot " + name + " failed with " + wait_status_to_string(status));
+        return "Oneshot " + name + " failed.\n";
+    }
+
+    service->running = true;
+    service->finished_successfully = false;
+    service->starting = false;
+    service->last_result = "running";
+    return "Started " + name + " (PID " + std::to_string(service->pid) + ").\n";
+}
+
+bool GServiceManager::wait_for_service_exit(ServiceState& service, pid_t expected_pid, uint32_t timeout_ms, std::string* detail) {
+    const uint32_t effective_timeout = timeout_ms == 0 ? 1 : timeout_ms;
+    uint32_t elapsed_ms = 0;
+
+    while (elapsed_ms <= effective_timeout) {
+        int status = 0;
+        pid_t result = waitpid(expected_pid, &status, WNOHANG);
+        if (result == expected_pid) {
+            handle_process_death(expected_pid, status);
+            if (detail) {
+                *detail = wait_status_to_string(status);
+            }
+            return true;
+        }
+
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == ECHILD) {
+                service.running = false;
+                service.pid = -1;
+                service.stopping = false;
+                if (detail) {
+                    *detail = "process already reaped";
+                }
+                return true;
+            }
+            if (detail) {
+                *detail = std::strerror(errno);
+            }
+            return false;
+        }
+
+        usleep(kStopPollIntervalUs);
+        elapsed_ms += static_cast<uint32_t>(kStopPollIntervalUs / 1000);
+    }
+
+    if (detail) {
+        *detail = "timeout";
+    }
+    return false;
+}
+
 std::string GServiceManager::stop_service(const std::string& name) {
-    if (services.find(name) == services.end()) return "Error: Service '" + name + "' not found.\n";
-    auto& s = services[name];
-    if (!s.running) return "Service '" + name + "' is not running.\n";
+    if (name.empty()) {
+        return "Error: Missing service name.\n";
+    }
 
-    log_message("[GSERVICE] Stopping " + name + " (PID " + std::to_string(s.pid) + ")...");
-    kill(s.pid, SIGTERM);
-    
-    // Simple wait (non-blocking attempt)
-    // The main loop handles the actual reaping, but we can give it a moment
-    usleep(100000); 
+    ServiceState* service = find_service(name);
+    if (!service) {
+        return "Error: Service '" + name + "' not found.\n";
+    }
+    if (!service->running || service->pid <= 0) {
+        service->running = false;
+        service->pid = -1;
+        return "Service '" + name + "' is not running.\n";
+    }
 
-    return "Signal SIGTERM sent to " + name + " (PID " + std::to_string(s.pid) + ").\n";
+    const pid_t expected_pid = service->pid;
+    service->stopping = true;
+    service->last_result = "stopping";
+
+    if (!service->config.stop.empty()) {
+        log_message("[GSERVICE] Running stop command for " + name);
+        const int rc = run_shell_command(service->config, service->config.stop, service_log_path(name));
+        if (rc != 0) {
+            log_error("[GSERVICE] stop command failed for " + name + " with " + std::to_string(rc));
+        }
+    }
+
+    if (kill(expected_pid, SIGTERM) != 0 && errno != ESRCH) {
+        service->stopping = false;
+        service->last_result = std::string("stop failed: ") + std::strerror(errno);
+        return "Failed to stop " + name + ": " + std::string(std::strerror(errno)) + ".\n";
+    }
+
+    std::string detail;
+    if (wait_for_service_exit(*service, expected_pid, service->config.stop_timeout_ms, &detail)) {
+        return "Stopped " + name + " (" + detail + ").\n";
+    }
+
+    log_error("[GSERVICE] " + name + " did not stop after SIGTERM; sending SIGKILL");
+    if (kill(expected_pid, SIGKILL) != 0 && errno != ESRCH) {
+        service->stopping = false;
+        service->last_result = std::string("kill failed: ") + std::strerror(errno);
+        return "Failed to kill " + name + ": " + std::string(std::strerror(errno)) + ".\n";
+    }
+
+    if (wait_for_service_exit(*service, expected_pid, 2000, &detail)) {
+        return "Stopped " + name + " after SIGKILL (" + detail + ").\n";
+    }
+
+    service->stopping = false;
+    service->last_result = "stop timeout";
+    return "Timed out while stopping " + name + ".\n";
 }
 
 std::string GServiceManager::restart_service(const std::string& name) {
-    std::string stop_msg = stop_service(name);
-    // Wait a bit for cleanup
-    usleep(500000);
-    std::string start_msg = start_service(name);
-    return stop_msg + start_msg;
+    if (name.empty()) {
+        return "Error: Missing service name.\n";
+    }
+
+    ServiceState* service = find_service(name);
+    if (!service) {
+        return "Error: Service '" + name + "' not found.\n";
+    }
+
+    std::string out;
+    if (service->running) {
+        out = stop_service(name);
+        if (service->running) {
+            return out;
+        }
+    }
+    return out + start_service(name);
 }
 
 std::string GServiceManager::enable_service(const std::string& name) {
-    std::string src = AVAILABLE_SERVICES_DIR + "/" + name + ".gservice";
-    std::string dest = SYSTEM_SERVICES_DIR + "/" + name + ".gservice";
-    
-    mkdir("/etc/ginit", 0755);
-    mkdir(SYSTEM_SERVICES_DIR.c_str(), 0755);
+    if (name.empty()) {
+        return "Error: Missing service name.\n";
+    }
+
+    const std::string src = join_path(AVAILABLE_SERVICES_DIR, name);
+    const std::string dest = join_path(SYSTEM_SERVICES_DIR, name);
+
+    ensure_directory("/etc/ginit", 0755);
+    ensure_directory("/etc/ginit/services", 0755);
+    ensure_directory(SYSTEM_SERVICES_DIR, 0755);
 
     if (access(src.c_str(), F_OK) != 0) {
         return "Error: Service '" + name + "' not available to enable.\n";
     }
 
     if (symlink(src.c_str(), dest.c_str()) != 0) {
-        if (errno == EEXIST) return "Service '" + name + "' is already enabled.\n";
-        perror("symlink");
-        return "Failed to enable " + name + ".\n";
-    } else {
-        log_message("[GSERVICE] Enabled " + name);
-        if (services.count(name)) services[name].enabled = true;
-        return "Enabled " + name + ".\n";
+        if (errno != EEXIST) {
+            return "Failed to enable " + name + ": " + std::string(std::strerror(errno)) + ".\n";
+        }
     }
+
+    if (ServiceState* service = find_service(name)) {
+        service->persistent_enabled = true;
+    }
+    log_message("[GSERVICE] Enabled " + name);
+    return "Enabled " + name + ".\n";
 }
 
 std::string GServiceManager::disable_service(const std::string& name) {
-    std::string dest = SYSTEM_SERVICES_DIR + "/" + name + ".gservice";
+    if (name.empty()) {
+        return "Error: Missing service name.\n";
+    }
+
+    const std::string dest = join_path(SYSTEM_SERVICES_DIR, name);
     if (unlink(dest.c_str()) != 0) {
-        if (errno == ENOENT) return "Service '" + name + "' is not enabled.\n";
-        perror("unlink");
-        return "Failed to disable " + name + ".\n";
-    } else {
-        log_message("[GSERVICE] Disabled " + name);
-        if (services.count(name)) services[name].enabled = false;
-        return "Disabled " + name + ".\n";
+        if (errno == ENOENT) {
+            return "Service '" + name + "' is not enabled.\n";
+        }
+        return "Failed to disable " + name + ": " + std::string(std::strerror(errno)) + ".\n";
     }
+
+    if (ServiceState* service = find_service(name)) {
+        service->persistent_enabled = false;
+    }
+    log_message("[GSERVICE] Disabled " + name);
+    if (ServiceState* service = find_service(name); service && service->preset_enabled) {
+        return "Disabled persistent enablement for " + name + ", but it is still started by a boot preset.\n";
+    }
+    return "Disabled " + name + ".\n";
 }
 
-std::vector<std::string> GServiceManager::get_service_order() {
-    std::map<std::string, bool> visited;
-    std::map<std::string, bool> stack;
-    std::vector<std::string> order;
-
-    for (const auto& pair : services) {
-        if (!visited[pair.first]) {
-            visit(pair.first, visited, stack, order);
-        }
+std::string GServiceManager::preset_service(const std::string& name) {
+    if (name.empty()) {
+        return "Error: Missing service name.\n";
     }
 
-    return order;
-}
-
-void GServiceManager::visit(const std::string& name, std::map<std::string, bool>& visited, std::map<std::string, bool>& stack, std::vector<std::string>& order) {
-    visited[name] = true;
-    stack[name] = true;
-
-    if (services.count(name)) {
-        for (const auto& dep : services[name].config->meta.deps.after) {
-            if (services.count(dep)) {
-                if (!visited[dep]) {
-                    visit(dep, visited, stack, order);
-                }
-            }
-        }
+    ServiceState* service = load_service_by_name(name, false);
+    if (!service) {
+        return "Error: Service '" + name + "' not found for boot preset.\n";
     }
 
-    stack[name] = false;
-    order.push_back(name);
-}
-
-void GServiceManager::start_enabled_services() {
-    std::vector<std::string> order = get_service_order();
-    for (const auto& name : order) {
-        if (services[name].enabled && !services[name].running) {
-            start_service(name);
-        }
-    }
-}
-
-std::string GServiceManager::start_service(const std::string& name) {
-    if (services.find(name) == services.end()) {
-        // Try to load from available if not already loaded
-        std::string path = AVAILABLE_SERVICES_DIR + "/" + name + ".gservice";
-        if (access(path.c_str(), F_OK) == 0) {
-            auto config = GServiceParser::parse_file(path);
-            if (config) {
-                services[name].config = std::move(config);
-                services[name].enabled = false;
-            }
-        } else {
-            return "Error: Service '" + name + "' not found.\n";
-        }
-    }
-
-    auto& s = services[name];
-    if (s.running) return "Service '" + name + "' is already running (PID " + std::to_string(s.pid) + ").\n";
-    if (s.finished_successfully && s.config->process.type == "oneshot") return "Oneshot service '" + name + "' has already finished successfully.\n";
-
-    // Handle 'Requires' dependencies
-    for (const auto& req : s.config->meta.deps.requires) {
-        if (services.find(req) == services.end() || (!services[req].running && !services[req].finished_successfully)) {
-            log_message("[GSERVICE] Starting requirement " + req + " for " + name);
-            start_service(req);
-            if (!services[req].running && !services[req].finished_successfully) {
-                 return "Failed to start requirement " + req + " for " + name + ".\n";
-            }
-        }
-    }
-
-    log_message("[GSERVICE] Starting " + name + "...");
-    s.pid = spawn_process(*(s.config));
-    if (s.pid > 0) {
-        if (s.config->process.type == "oneshot") {
-            int status;
-            waitpid(s.pid, &status, 0);
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                log_message("[GSERVICE] Oneshot " + name + " finished successfully.");
-                s.running = false; 
-                s.finished_successfully = true;
-                return "Oneshot " + name + " finished successfully.\n";
-            } else {
-                log_error("[GSERVICE] Oneshot " + name + " failed.");
-                s.finished_successfully = false;
-                return "Oneshot " + name + " failed.\n";
-            }
-        } else {
-            s.running = true;
-            s.finished_successfully = false; // Reset if it was a re-start
-            pid_to_name[s.pid] = name;
-            return "Started " + name + " (PID " + std::to_string(s.pid) + ").\n";
-        }
-    }
-    return "Failed to start " + name + ".\n";
+    service->preset_enabled = true;
+    return "Preset " + name + ".\n";
 }
 
 void GServiceManager::handle_process_death(pid_t pid, int status) {
-    if (pid_to_name.find(pid) == pid_to_name.end()) return;
+    ServiceState* service = find_service_by_pid(pid);
+    if (!service) {
+        return;
+    }
 
-    std::string name = pid_to_name[pid];
-    auto& s = services[name];
-    s.running = false;
-    pid_to_name.erase(pid);
+    const std::string name = service->config.name;
+    service->running = false;
+    service->pid = -1;
+    service->starting = false;
+    service->last_result = wait_status_to_string(status);
 
-    log_message("[GSERVICE] Service " + name + " (pid " + std::to_string(pid) + ") exited with status " + std::to_string(status));
+    log_message("[GSERVICE] Service " + name + " (" + std::to_string(pid) + ") exited with " + wait_status_to_string(status));
 
-    // Do not supervise/restart oneshot services here, they are handled in start_service
-    if (s.config->process.type == "oneshot") return;
+    if (service->config.type == ServiceType::Oneshot) {
+        service->finished_successfully = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        service->stopping = false;
+        return;
+    }
 
-    // Handle restart delay
-    unsigned long delay = parse_duration(s.config->process.lifecycle.restart_delay);
-    if (delay > 0) usleep(delay);
+    if (service->stopping) {
+        service->stopping = false;
+        service->finished_successfully = false;
+        return;
+    }
 
-    // Restart policy check
-    if (s.config->process.lifecycle.restart_policy == "on-failure") {
-        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-            start_service(name);
-        } else if (WIFSIGNALED(status)) {
-            start_service(name);
-        }
-    } else if (s.config->process.lifecycle.restart_policy == "always") {
+    if (service->config.restart_delay_us > 0) {
+        usleep(service->config.restart_delay_us);
+    }
+
+    bool should_restart = false;
+    if (service->config.restart_policy == RestartPolicy::Always) {
+        should_restart = true;
+    } else if (service->config.restart_policy == RestartPolicy::OnFailure) {
+        should_restart = !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+
+    if (should_restart) {
+        ++service->restart_count;
+        log_message("[GSERVICE] Restarting " + name);
         start_service(name);
     }
 }
 
 bool GServiceManager::is_managed_process(pid_t pid) const {
-    return pid_to_name.find(pid) != pid_to_name.end();
+    for (const auto& service : services_) {
+        if (service.pid == pid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string GServiceManager::status_for_service(const ServiceState& service) const {
+    std::string out;
+    out.reserve(240);
+    out += "Service: " + service.config.name + "\n";
+    out += "  Status: ";
+    out += service.running ? "Running" : (service.finished_successfully ? "Finished" : "Stopped");
+    out += "\n";
+    if (service.running) {
+        out += "  PID: " + std::to_string(service.pid) + "\n";
+    }
+    out += "  Enabled: ";
+    out += is_enabled(service) ? "Yes\n" : "No\n";
+    out += "  Persistent: ";
+    out += service.persistent_enabled ? "Yes\n" : "No\n";
+    out += "  Boot preset: ";
+    out += service.preset_enabled ? "Yes\n" : "No\n";
+    out += "  Description: " + service.config.description + "\n";
+    return out;
+}
+
+std::string GServiceManager::detail_for_service(const ServiceState& service) const {
+    std::string out = status_for_service(service);
+    if (!service.source_path.empty()) {
+        out += "  Source: " + service.source_path + "\n";
+    }
+    out += "  Type: ";
+    out += service.config.type == ServiceType::Oneshot ? "oneshot\n" : "simple\n";
+    out += "  Restart policy: ";
+    if (service.config.restart_policy == RestartPolicy::Always) {
+        out += "always\n";
+    } else if (service.config.restart_policy == RestartPolicy::OnFailure) {
+        out += "on-failure\n";
+    } else {
+        out += "never\n";
+    }
+    if (service.config.restart_delay_us > 0) {
+        out += "  Restart delay: " + std::to_string(service.config.restart_delay_us / 1000U) + " ms\n";
+    }
+    out += "  Stop timeout: " + std::to_string(service.config.stop_timeout_ms) + " ms\n";
+    if (!service.config.user.empty()) {
+        out += "  User: " + service.config.user + "\n";
+    }
+    if (!service.config.group.empty()) {
+        out += "  Group: " + service.config.group + "\n";
+    }
+    if (!service.config.work_dir.empty()) {
+        out += "  Work dir: " + service.config.work_dir + "\n";
+    }
+    if (!service.config.env_file.empty()) {
+        out += "  Env file: " + service.config.env_file + "\n";
+    }
+    if (!service.config.after.empty()) {
+        out += "  After: " + join_strings(service.config.after) + "\n";
+    }
+    if (!service.config.required_services.empty()) {
+        out += "  Requires: " + join_strings(service.config.required_services) + "\n";
+    }
+    if (!service.config.wants.empty()) {
+        out += "  Wants: " + join_strings(service.config.wants) + "\n";
+    }
+    out += "  Log file: " + service_log_path(service.config.name) + "\n";
+    if (!service.config.start_pre.empty()) {
+        out += "  StartPre: " + service.config.start_pre + "\n";
+    }
+    out += "  Start: " + service.config.start + "\n";
+    if (!service.config.stop.empty()) {
+        out += "  Stop: " + service.config.stop + "\n";
+    }
+    if (!service.last_result.empty()) {
+        out += "  Last result: " + service.last_result + "\n";
+    }
+    if (service.restart_count > 0) {
+        out += "  Restart count: " + std::to_string(service.restart_count) + "\n";
+    }
+    return out;
 }
 
 void GServiceManager::print_status() {
     log_message(get_status_str());
 }
 
-std::string GServiceManager::get_status_str() {
-    std::stringstream ss;
-    ss << "Ginit Service Status:" << std::endl;
-    ss << "---------------------------------------------------" << std::endl;
-    if (services.empty()) {
-        ss << "No services loaded." << std::endl;
+std::string GServiceManager::get_status_str() const {
+    std::string out;
+    out.reserve(128 + services_.size() * 96);
+    out += "Ginit Service Status:\n";
+    out += "---------------------------------------------------\n";
+    if (services_.empty()) {
+        out += "No services loaded.\n";
+        return out;
     }
-    for (const auto& pair : services) {
-        const auto& s = pair.second;
-        std::string status_label = "[ STOPPED ] ";
-        if (s.running) status_label = "[ RUNNING ] ";
-        else if (s.finished_successfully) status_label = "[ FINISHED ] ";
 
-        ss << status_label 
-                  << pair.first << " (PID: " << (s.running ? std::to_string(s.pid) : "-") << ")" << std::endl;
-        ss << "   Description: " << s.config->meta.description << std::endl;
+    for (const auto& service : services_) {
+        if (service.running) {
+            out += "[ RUNNING ] ";
+        } else if (service.finished_successfully) {
+            out += "[ FINISHED ] ";
+        } else {
+            out += "[ STOPPED ] ";
+        }
+        out += service.config.name;
+        out += " (PID: ";
+        out += service.running ? std::to_string(service.pid) : "-";
+        out += ")\n";
+        if (service.persistent_enabled) {
+            out += "   Boot: persistent";
+            if (service.preset_enabled) out += ", preset";
+            out += "\n";
+        } else if (service.preset_enabled) {
+            out += "   Boot: preset\n";
+        }
+        out += "   Description: " + service.config.description + "\n";
     }
-    return ss.str();
+    return out;
 }
 
 void GServiceManager::print_service_status(const std::string& name) {
-    if (services.find(name) == services.end()) {
+    const ServiceState* service = find_service(name);
+    if (!service) {
         log_message("Service " + name + " not found.");
         return;
     }
-    auto& s = services[name];
-    std::stringstream ss;
-    ss << "Service: " << name << "\n";
-    std::string status_str = s.running ? "Running" : (s.finished_successfully ? "Finished" : "Stopped");
-    ss << "  Status: " << status_str << "\n";
-    if (s.running) ss << "  PID: " << s.pid << "\n";
-    ss << "  Enabled: " << (s.enabled ? "Yes" : "No") << "\n";
-    ss << "  Description: " << s.config->meta.description << "\n";
-    log_message(ss.str());
+    log_message(status_for_service(*service));
 }
 
-void GServiceManager::run_ipc_server() {
-    std::thread([this]() {
-        int server_fd, client_fd;
-        struct sockaddr_un addr;
+std::string GServiceManager::get_service_details_str(const std::string& name) const {
+    if (name.empty()) {
+        return "Error: Missing service name.\n";
+    }
 
-        if ((server_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
-            perror("socket error");
-            return;
-        }
+    if (const ServiceState* service = find_service(name)) {
+        return detail_for_service(*service);
+    }
 
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, get_socket_path().c_str(), sizeof(addr.sun_path) - 1);
+    std::string error;
+    ServiceState unloaded;
+    if (load_service_snapshot(name, unloaded, &error)) {
+        return detail_for_service(unloaded);
+    }
 
-        unlink(get_socket_path().c_str());
+    return "Service '" + name + "' not found.\n";
+}
 
-        if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-            perror("bind error");
-            return;
-        }
+bool GServiceManager::start_ipc_server() {
+    if (ipc_server_fd_ >= 0) {
+        return true;
+    }
 
-        if (listen(server_fd, 5) == -1) {
-            perror("listen error");
-            return;
-        }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        log_error("[GSERVICE] socket error: " + std::string(std::strerror(errno)));
+        return false;
+    }
+    if (!set_close_on_exec(fd)) {
+        log_error("[GSERVICE] failed to mark IPC socket close-on-exec");
+    }
 
-        chmod(get_socket_path().c_str(), 0666);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        log_error("[GSERVICE] failed to mark IPC socket nonblocking");
+        close(fd);
+        return false;
+    }
 
-        while (true) {
-            if ((client_fd = accept(server_fd, NULL, NULL)) == -1) {
-                perror("accept error");
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    if (socket_path_.size() >= sizeof(addr.sun_path)) {
+        log_error("[GSERVICE] IPC socket path is too long: " + socket_path_);
+        close(fd);
+        return false;
+    }
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path_.c_str());
+
+    unlink(socket_path_.c_str());
+    if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        log_error("[GSERVICE] bind error: " + std::string(std::strerror(errno)));
+        close(fd);
+        return false;
+    }
+    if (listen(fd, 8) != 0) {
+        log_error("[GSERVICE] listen error: " + std::string(std::strerror(errno)));
+        close(fd);
+        unlink(socket_path_.c_str());
+        return false;
+    }
+    if (chmod(socket_path_.c_str(), 0666) != 0) {
+        log_error("[GSERVICE] chmod on IPC socket failed: " + std::string(std::strerror(errno)));
+    }
+
+    ipc_server_fd_ = fd;
+    return true;
+}
+
+void GServiceManager::shutdown_ipc_server() {
+    if (ipc_server_fd_ >= 0) {
+        close(ipc_server_fd_);
+        ipc_server_fd_ = -1;
+    }
+    if (!socket_path_.empty()) {
+        unlink(socket_path_.c_str());
+    }
+}
+
+int GServiceManager::ipc_server_fd() const {
+    return ipc_server_fd_;
+}
+
+bool GServiceManager::write_all(int fd, const char* data, size_t length) {
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t written = write(fd, data + offset, length - offset);
+        if (written < 0) {
+            if (errno == EINTR) {
                 continue;
             }
-            handle_ipc_client(client_fd);
+            return false;
         }
-    }).detach();
+        offset += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+std::string GServiceManager::handle_command(const std::string& command) {
+    const std::string trimmed = trim_copy(command);
+    if (trimmed.empty()) {
+        return "Empty command\n";
+    }
+
+    const size_t space = trimmed.find_first_of(" \t\r\n");
+    const std::string action = space == std::string::npos ? trimmed : trimmed.substr(0, space);
+    std::string name;
+    if (space != std::string::npos) {
+        name = trim_copy(trimmed.substr(space + 1));
+    }
+
+    if (action == "status") {
+        if (name.empty()) {
+            return get_status_str();
+        }
+
+        if (ServiceState* service = find_service(name)) {
+            return status_for_service(*service);
+        }
+
+        std::string error;
+        ServiceState unloaded;
+        if (load_service_snapshot(name, unloaded, &error)) {
+            return status_for_service(unloaded);
+        }
+
+        return "Service '" + name + "' not found.\n";
+    }
+    if (action == "show") {
+        if (name.empty()) {
+            return "Error: Missing service name.\n";
+        }
+
+        return get_service_details_str(name);
+    }
+    if (action == "start") {
+        return start_service(name);
+    }
+    if (action == "stop") {
+        return stop_service(name);
+    }
+    if (action == "restart") {
+        return restart_service(name);
+    }
+    if (action == "enable") {
+        return enable_service(name);
+    }
+    if (action == "disable") {
+        return disable_service(name);
+    }
+    return "Unknown command\n";
 }
 
 void GServiceManager::handle_ipc_client(int client_fd) {
-    char buf[1024];
-    int n = read(client_fd, buf, sizeof(buf) - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        std::string cmd(buf);
-        std::stringstream ss(cmd);
-        std::string action, name;
-        ss >> action >> name;
-
-        std::string response;
-        if (action == "status") {
-            if (name.empty()) response = get_status_str();
-            else {
-                 if (services.find(name) != services.end()) {
-                    auto& s = services[name];
-                    std::stringstream status_ss;
-                    status_ss << "Service: " << name << "\n";
-                    std::string status_str = s.running ? "Running" : (s.finished_successfully ? "Finished" : "Stopped");
-                    status_ss << "  Status: " << status_str << "\n";
-                    if (s.running) status_ss << "  PID: " << s.pid << "\n";
-                    status_ss << "  Enabled: " << (s.enabled ? "Yes" : "No") << "\n";
-                    status_ss << "  Description: " << s.config->meta.description << "\n";
-                    response = status_ss.str();
-                } else {
-                    response = "Service '" + name + "' not found.\n";
-                }
-            }
-        } else if (action == "start") {
-            response = start_service(name);
-        } else if (action == "stop") {
-            response = stop_service(name);
-        } else if (action == "restart") {
-            response = restart_service(name);
-        } else if (action == "enable") {
-            response = enable_service(name);
-        } else if (action == "disable") {
-            response = disable_service(name);
-        } else {
-            response = "Unknown command\n";
+    char buffer[1024];
+    ssize_t received = 0;
+    while (true) {
+        received = read(client_fd, buffer, sizeof(buffer) - 1);
+        if (received < 0 && errno == EINTR) {
+            continue;
         }
-        write(client_fd, response.c_str(), response.size());
+        break;
     }
-    close(client_fd);
+
+    if (received > 0) {
+        buffer[received] = '\0';
+        const std::string response = handle_command(buffer);
+        if (!write_all(client_fd, response.c_str(), response.size())) {
+            log_error("[GSERVICE] failed to write IPC response");
+        }
+    }
 }
 
-void GServiceManager::send_command(const std::string& command) {
-    int fd;
-    struct sockaddr_un addr;
-
-    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
-        perror("socket error");
+void GServiceManager::accept_pending_ipc_clients() {
+    if (ipc_server_fd_ < 0) {
         return;
     }
 
-    memset(&addr, 0, sizeof(addr));
+    while (true) {
+        int client_fd = accept(ipc_server_fd_, nullptr, nullptr);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            log_error("[GSERVICE] accept error: " + std::string(std::strerror(errno)));
+            break;
+        }
+
+        if (!set_close_on_exec(client_fd)) {
+            log_error("[GSERVICE] failed to mark IPC client close-on-exec");
+        }
+        handle_ipc_client(client_fd);
+        close(client_fd);
+    }
+}
+
+bool GServiceManager::send_command(const std::string& command, std::string* response, std::string* error) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (error) {
+            *error = std::string("socket error: ") + std::strerror(errno);
+        }
+        return false;
+    }
+    set_close_on_exec(fd);
+
+    struct sockaddr_un addr {};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, get_socket_path().c_str(), sizeof(addr.sun_path) - 1);
-
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-        std::cerr << "Could not connect to ginit. Is it running as PID 1?" << std::endl;
+    const std::string socket_path = get_socket_path();
+    if (socket_path.size() >= sizeof(addr.sun_path)) {
+        if (error) {
+            *error = "ginit socket path is too long";
+        }
         close(fd);
-        return;
+        return false;
+    }
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path.c_str());
+
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        if (error) {
+            *error = "Could not connect to ginit. Is it running as PID 1?";
+        }
+        close(fd);
+        return false;
     }
 
-    write(fd, command.c_str(), command.size());
+    if (!write_all(fd, command.c_str(), command.size())) {
+        if (error) {
+            *error = "Failed to send command to ginit";
+        }
+        close(fd);
+        return false;
+    }
 
-    char buf[4096];
-    int n;
-    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = '\0';
-        std::cout << buf;
+    char buffer[4096];
+    while (true) {
+        ssize_t received = read(fd, buffer, sizeof(buffer) - 1);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            break;
+        }
+        buffer[received] = '\0';
+        if (response) {
+            response->append(buffer, static_cast<size_t>(received));
+        } else {
+            std::fputs(buffer, stdout);
+        }
     }
 
     close(fd);
+    return true;
 }
 
 } // namespace ginit
