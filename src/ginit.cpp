@@ -131,10 +131,6 @@ int run_helper_command(const std::string& path, const std::vector<std::string>& 
 
 void configure_selinux_runtime() {
     const bool is_live = access("/etc/geminios-live", F_OK) == 0;
-    if (is_live) {
-        std::cout << "[GINIT] Live environment detected; skipping SELinux policy load." << std::endl;
-        return;
-    }
 
     auto config = load_os_release_fields("/etc/selinux/config");
     std::string mode = to_lower_copy_local(release_field_or(config, "SELINUX", "disabled"));
@@ -152,7 +148,7 @@ void configure_selinux_runtime() {
         return;
     }
 
-    const bool want_permissive = mode == "permissive";
+    const bool want_permissive = is_live || mode == "permissive";
 
     const std::string load_policy = find_first_existing_path({
         "/usr/sbin/load_policy",
@@ -168,6 +164,9 @@ void configure_selinux_runtime() {
     }
 
     if (want_permissive) {
+        if (is_live) {
+            std::cout << "[GINIT] Live environment detected; forcing SELinux permissive mode." << std::endl;
+        }
         const std::string setenforce = find_first_existing_path({
             "/usr/sbin/setenforce",
             "/sbin/setenforce",
