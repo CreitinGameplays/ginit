@@ -114,17 +114,70 @@ std::string join_path(const char* base, const std::string& name) {
     return std::string(base) + "/" + name + ".gservice";
 }
 
-} // namespace
-
-std::string GServiceManager::get_socket_path() {
+std::vector<std::string> socket_path_candidates() {
+    std::vector<std::string> paths;
     const char* env_path = getenv("GINIT_SOCK");
     if (env_path && *env_path) {
-        return env_path;
+        paths.emplace_back(env_path);
     }
-    return "/run/ginit.sock";
+
+    for (const char* candidate : {"/run/ginit.sock", "/dev/ginit.sock", "/tmp/ginit.sock"}) {
+        if (std::find(paths.begin(), paths.end(), candidate) == paths.end()) {
+            paths.emplace_back(candidate);
+        }
+    }
+    return paths;
 }
 
-GServiceManager::GServiceManager() : socket_path_(get_socket_path()) {}
+std::string parent_dir(std::string path) {
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) {
+        return ".";
+    }
+    if (slash == 0) {
+        return "/";
+    }
+    return path.substr(0, slash);
+}
+
+bool ensure_directory_tree(const std::string& path, mode_t mode) {
+    if (path.empty() || path == ".") {
+        return true;
+    }
+
+    size_t offset = 0;
+    if (path[0] == '/') {
+        offset = 1;
+    }
+
+    while (offset <= path.size()) {
+        const size_t slash = path.find('/', offset);
+        const std::string segment = slash == std::string::npos ? path : path.substr(0, slash);
+        offset = slash == std::string::npos ? path.size() + 1 : slash + 1;
+
+        if (segment.empty()) {
+            continue;
+        }
+        if (mkdir(segment.c_str(), mode) != 0 && errno != EEXIST) {
+            log_error("mkdir failed for " + segment + ": " + std::strerror(errno));
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string socket_paths_for_display() {
+    return join_strings(socket_path_candidates());
+}
+
+bool is_socket_node(const std::string& path) {
+    struct stat st {};
+    return lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode);
+}
+
+} // namespace
+
+GServiceManager::GServiceManager() = default;
 
 GServiceManager::~GServiceManager() {
     shutdown_ipc_server();
@@ -1023,49 +1076,60 @@ bool GServiceManager::start_ipc_server() {
         return true;
     }
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        log_error("[GSERVICE] socket error: " + std::string(std::strerror(errno)));
-        return false;
-    }
-    if (!set_close_on_exec(fd)) {
-        log_error("[GSERVICE] failed to mark IPC socket close-on-exec");
+    for (const std::string& candidate : socket_path_candidates()) {
+        struct sockaddr_un addr {};
+        if (candidate.size() >= sizeof(addr.sun_path)) {
+            log_error("[GSERVICE] IPC socket path is too long: " + candidate);
+            continue;
+        }
+        if (!ensure_directory_tree(parent_dir(candidate), 0755)) {
+            log_error("[GSERVICE] IPC socket directory is unavailable for " + candidate);
+            continue;
+        }
+
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            log_error("[GSERVICE] socket error while opening " + candidate + ": " + std::string(std::strerror(errno)));
+            continue;
+        }
+        if (!set_close_on_exec(fd)) {
+            log_error("[GSERVICE] failed to mark IPC socket close-on-exec");
+        }
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            log_error("[GSERVICE] failed to mark IPC socket nonblocking");
+            close(fd);
+            continue;
+        }
+
+        addr.sun_family = AF_UNIX;
+        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", candidate.c_str());
+
+        unlink(candidate.c_str());
+        if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+            log_error("[GSERVICE] bind error on " + candidate + ": " + std::string(std::strerror(errno)));
+            close(fd);
+            continue;
+        }
+        if (listen(fd, 8) != 0) {
+            log_error("[GSERVICE] listen error on " + candidate + ": " + std::string(std::strerror(errno)));
+            close(fd);
+            unlink(candidate.c_str());
+            continue;
+        }
+        if (chmod(candidate.c_str(), 0666) != 0) {
+            log_error("[GSERVICE] chmod on IPC socket failed for " + candidate + ": " + std::string(std::strerror(errno)));
+        }
+
+        socket_path_ = candidate;
+        ipc_server_fd_ = fd;
+        log_message("[GSERVICE] IPC control socket ready at " + socket_path_);
+        return true;
     }
 
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        log_error("[GSERVICE] failed to mark IPC socket nonblocking");
-        close(fd);
-        return false;
-    }
-
-    struct sockaddr_un addr {};
-    addr.sun_family = AF_UNIX;
-    if (socket_path_.size() >= sizeof(addr.sun_path)) {
-        log_error("[GSERVICE] IPC socket path is too long: " + socket_path_);
-        close(fd);
-        return false;
-    }
-    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path_.c_str());
-
-    unlink(socket_path_.c_str());
-    if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
-        log_error("[GSERVICE] bind error: " + std::string(std::strerror(errno)));
-        close(fd);
-        return false;
-    }
-    if (listen(fd, 8) != 0) {
-        log_error("[GSERVICE] listen error: " + std::string(std::strerror(errno)));
-        close(fd);
-        unlink(socket_path_.c_str());
-        return false;
-    }
-    if (chmod(socket_path_.c_str(), 0666) != 0) {
-        log_error("[GSERVICE] chmod on IPC socket failed: " + std::string(std::strerror(errno)));
-    }
-
-    ipc_server_fd_ = fd;
-    return true;
+    log_error("[GSERVICE] failed to start IPC server on any control socket path: " + socket_paths_for_display());
+    return false;
 }
 
 void GServiceManager::shutdown_ipc_server() {
@@ -1199,62 +1263,100 @@ void GServiceManager::accept_pending_ipc_clients() {
 }
 
 bool GServiceManager::send_command(const std::string& command, std::string* response, std::string* error) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        if (error) {
-            *error = std::string("socket error: ") + std::strerror(errno);
-        }
-        return false;
-    }
-    set_close_on_exec(fd);
+    std::string first_error;
+    bool saw_socket_node = false;
+    bool saw_unreachable_socket = false;
 
-    struct sockaddr_un addr {};
-    addr.sun_family = AF_UNIX;
-    const std::string socket_path = get_socket_path();
-    if (socket_path.size() >= sizeof(addr.sun_path)) {
-        if (error) {
-            *error = "ginit socket path is too long";
+    for (const std::string& socket_path : socket_path_candidates()) {
+        if (is_socket_node(socket_path)) {
+            saw_socket_node = true;
         }
-        close(fd);
-        return false;
-    }
-    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path.c_str());
 
-    if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
-        if (error) {
-            *error = "Could not connect to ginit. Is it running as PID 1?";
-        }
-        close(fd);
-        return false;
-    }
-
-    if (!write_all(fd, command.c_str(), command.size())) {
-        if (error) {
-            *error = "Failed to send command to ginit";
-        }
-        close(fd);
-        return false;
-    }
-
-    char buffer[4096];
-    while (true) {
-        ssize_t received = read(fd, buffer, sizeof(buffer) - 1);
-        if (received < 0 && errno == EINTR) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            if (first_error.empty()) {
+                first_error = std::string("socket error: ") + std::strerror(errno);
+            }
             continue;
         }
-        if (received <= 0) {
-            break;
+        set_close_on_exec(fd);
+
+        struct sockaddr_un addr {};
+        addr.sun_family = AF_UNIX;
+        if (socket_path.size() >= sizeof(addr.sun_path)) {
+            if (first_error.empty()) {
+                first_error = "ginit socket path is too long: " + socket_path;
+            }
+            close(fd);
+            continue;
         }
-        buffer[received] = '\0';
-        if (response) {
-            response->append(buffer, static_cast<size_t>(received));
-        } else {
-            std::fputs(buffer, stdout);
+        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path.c_str());
+
+        if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+            const int connect_errno = errno;
+            if (connect_errno == ECONNREFUSED || connect_errno == ENOENT || connect_errno == ECONNRESET) {
+                saw_unreachable_socket = true;
+            }
+            if (first_error.empty()) {
+                first_error = "Could not connect to ginit via " + socket_path + ": " + std::strerror(connect_errno);
+            }
+            close(fd);
+            continue;
         }
+
+        if (!write_all(fd, command.c_str(), command.size())) {
+            if (error) {
+                *error = "Failed to send command to ginit via " + socket_path;
+            }
+            close(fd);
+            return false;
+        }
+
+        char buffer[4096];
+        while (true) {
+            ssize_t received = read(fd, buffer, sizeof(buffer) - 1);
+            if (received < 0 && errno == EINTR) {
+                continue;
+            }
+            if (received <= 0) {
+                break;
+            }
+            buffer[received] = '\0';
+            if (response) {
+                response->append(buffer, static_cast<size_t>(received));
+            } else {
+                std::fputs(buffer, stdout);
+            }
+        }
+
+        close(fd);
+        return true;
     }
 
-    close(fd);
-    return true;
+    if (error) {
+        if (!saw_socket_node) {
+            *error = "Could not connect to ginit. No control socket was found in: " + socket_paths_for_display();
+        } else if (saw_unreachable_socket) {
+            *error = "Could not connect to ginit. Its control socket exists but is not accepting commands.";
+        } else if (!first_error.empty()) {
+            *error = first_error;
+        } else {
+            *error = "Could not connect to ginit. Is it running as PID 1?";
+        }
+    }
+    return false;
+}
+
+bool GServiceManager::control_socket_present(std::string* path) {
+    for (const std::string& candidate : socket_path_candidates()) {
+        if (is_socket_node(candidate)) {
+            if (path) {
+                *path = candidate;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace ginit

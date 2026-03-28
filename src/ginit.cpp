@@ -78,6 +78,14 @@ bool has_gservice_suffix(const std::string& filename) {
     return filename.size() > 9 && filename.substr(filename.size() - 9) == ".gservice";
 }
 
+std::string basename_copy_local(const char* path) {
+    if (!path || !*path) {
+        return "";
+    }
+    const char* slash = std::strrchr(path, '/');
+    return slash ? std::string(slash + 1) : std::string(path);
+}
+
 bool is_valid_service_ref(const std::string& name) {
     if (name.empty()) {
         return false;
@@ -400,6 +408,93 @@ bool run_local_configuration_check(const std::string& service_name) {
                   << warning_count << " warning(s))" << std::endl;
     }
     return error_count == 0;
+}
+
+std::string render_offline_service_status(const LocalServiceInfo& service) {
+    std::string out = "Service: " + service.config.name + "\n";
+    out += "  Runtime: unknown (ginit control socket unavailable)\n";
+    out += "  Enabled at boot: " + std::string((service.persistent_enabled || service.preset_enabled) ? "yes" : "no") + "\n";
+    if (service.persistent_enabled) {
+        out += "  Enable source: persistent\n";
+    } else if (service.preset_enabled) {
+        out += "  Enable source: boot preset\n";
+    } else {
+        out += "  Enable source: not enabled\n";
+    }
+    out += "  Source: " + service.source_path + "\n";
+    return out;
+}
+
+bool print_local_status(const std::string& service_name) {
+    std::vector<ConfigIssue> issues;
+    const std::map<std::string, LocalServiceInfo> services = load_local_service_catalog(issues);
+
+    if (!service_name.empty()) {
+        auto it = services.find(service_name);
+        if (it == services.end()) {
+            std::cerr << "Service '" << service_name << "' not found." << std::endl;
+            return false;
+        }
+        std::cout << render_offline_service_status(it->second);
+        return true;
+    }
+
+    if (services.empty()) {
+        std::cout << "No ginit services were found." << std::endl;
+        return true;
+    }
+
+    std::cout << "ginit offline status (runtime state unavailable):" << std::endl;
+    for (const auto& entry : services) {
+        const LocalServiceInfo& service = entry.second;
+        std::cout << "  "
+                  << ((service.persistent_enabled || service.preset_enabled) ? "[enabled] " : "[disabled] ")
+                  << service.config.name;
+        if (service.persistent_enabled) {
+            std::cout << " (persistent)";
+        } else if (service.preset_enabled) {
+            std::cout << " (preset)";
+        }
+        std::cout << std::endl;
+    }
+    return true;
+}
+
+bool should_try_local_cli_fallback(const std::string& cmd, const std::string& error) {
+    if (error.find("No control socket was found") != std::string::npos) {
+        return true;
+    }
+    if (error.find("control socket exists but is not accepting commands") != std::string::npos) {
+        return cmd == "status" || cmd == "show" || cmd == "enable" || cmd == "disable";
+    }
+    return false;
+}
+
+int run_local_cli_fallback(const std::string& cmd, const std::string& service) {
+    if (cmd == "status") {
+        return print_local_status(service) ? 0 : 1;
+    }
+    if (cmd == "show") {
+        return print_local_service_details(service) ? 0 : 1;
+    }
+    if (cmd == "enable" || cmd == "disable") {
+        ginit::GServiceManager local_manager;
+        std::string response = (cmd == "enable")
+            ? local_manager.enable_service(service)
+            : local_manager.disable_service(service);
+        std::cout << response;
+        return response_indicates_failure(response) ? 1 : 0;
+    }
+    if (cmd == "start") {
+        ginit::GServiceManager local_manager;
+        local_manager.load_services_from_dir(SYSTEM_SERVICES_DIR, true);
+        std::cerr << "Warning: ginit control socket is unavailable; performing an emergency local start." << std::endl;
+        std::cerr << "         The service will run, but it will not be supervised by PID 1 until control is restored." << std::endl;
+        const std::string response = local_manager.start_service(service);
+        std::cout << response;
+        return response_indicates_failure(response) ? 1 : 0;
+    }
+    return -1;
 }
 
 void apply_boot_presets(ginit::GServiceManager& manager) {
@@ -874,6 +969,8 @@ void show_help() {
 int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    const std::string invoked_as = basename_copy_local(argv[0]);
+    const bool invoked_as_ginit = (invoked_as == "ginit");
 
     if (getpid() == 1) {
         if (setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/bin/apps/system:/bin/apps", 1) != 0) {
@@ -888,14 +985,24 @@ int main(int argc, char* argv[]) {
 
     if (getpid() != 1) {
         if (argc < 2) {
-            show_help();
+            if (invoked_as_ginit) {
+                show_help();
+                return 0;
+            } else {
+                std::cerr << "This binary is the GeminiOS init entry point." << std::endl;
+                std::cerr << "Use 'ginit <command>' for service management." << std::endl;
+            }
             return 1;
         }
 
         std::string cmd = argv[1];
         if (cmd == "help" || cmd == "--help" || cmd == "-h") {
-            show_help();
-            return 0;
+            if (invoked_as_ginit) {
+                show_help();
+                return 0;
+            }
+            std::cerr << "Use 'ginit help' to view the ginit CLI." << std::endl;
+            return 1;
         }
 
         std::string service = (argc > 2) ? argv[2] : "";
@@ -920,16 +1027,25 @@ int main(int argc, char* argv[]) {
                 std::cout << response;
                 return response_indicates_failure(response) ? 1 : 0;
             }
-            if (!error.empty()) {
-                std::cerr << error << std::endl;
+            if (!should_try_local_cli_fallback(cmd, error)) {
+                if (!error.empty()) {
+                    std::cerr << error << std::endl;
+                }
+                return 1;
             }
-            return print_local_service_details(service) ? 0 : 1;
+            return run_local_cli_fallback(cmd, service);
         }
 
         if (cmd == "status" || cmd == "start" || cmd == "stop" || cmd == "restart" || cmd == "enable" || cmd == "disable") {
             std::string response;
             std::string error;
             if (!ginit::GServiceManager::send_command(cmd + " " + service, &response, &error)) {
+                if (should_try_local_cli_fallback(cmd, error)) {
+                    const int fallback_rc = run_local_cli_fallback(cmd, service);
+                    if (fallback_rc >= 0) {
+                        return fallback_rc;
+                    }
+                }
                 if (!error.empty()) {
                     std::cerr << error << std::endl;
                 }
@@ -940,7 +1056,11 @@ int main(int argc, char* argv[]) {
         }
 
         std::cerr << "Unknown command: " << cmd << std::endl;
-        show_help();
+        if (invoked_as_ginit) {
+            show_help();
+        } else {
+            std::cerr << "Use 'ginit help' to view the ginit CLI." << std::endl;
+        }
         return 1;
     }
 
@@ -986,6 +1106,10 @@ int main(int argc, char* argv[]) {
 
     configure_selinux_runtime();
 
+    if (!service_manager.start_ipc_server()) {
+        std::cerr << "[GINIT] IPC server could not be started early; retrying after service startup." << std::endl;
+    }
+
     std::cerr << "[GINIT] Loading enabled system services..." << std::endl;
     service_manager.load_services_from_dir(SYSTEM_SERVICES_DIR, true);
 
@@ -994,7 +1118,7 @@ int main(int argc, char* argv[]) {
 
     std::cerr << "[GINIT] Starting system services..." << std::endl;
     service_manager.start_enabled_services();
-    if (!service_manager.start_ipc_server()) {
+    if (service_manager.ipc_server_fd() < 0 && !service_manager.start_ipc_server()) {
         std::cerr << "[GINIT] IPC server could not be started; CLI control will be unavailable." << std::endl;
     }
 

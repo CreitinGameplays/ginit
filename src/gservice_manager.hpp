@@ -53,6 +53,7 @@ public:
     int ipc_server_fd() const;
 
     static bool send_command(const std::string& command, std::string* response = nullptr, std::string* error = nullptr);
+    static bool control_socket_present(std::string* path = nullptr);
 
 private:
     std::vector<ServiceState> services_;
@@ -85,7 +86,6 @@ private:
     void visit(size_t index, std::vector<unsigned char>& state, std::vector<size_t>& order) const;
 
     static bool write_all(int fd, const char* data, size_t length);
-    static std::string get_socket_path();
 };
 
 } // namespace ginit
