@@ -67,7 +67,6 @@ Example override:
 
 ```text
 -network
-sshd
 ```
 
 ## Administration
@@ -76,7 +75,7 @@ sshd
 ginit status
 ginit show dbus
 ginit check
-ginit enable sshd
+ginit enable network
 ginit disable elogind
 ```
 

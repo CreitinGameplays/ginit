@@ -31,7 +31,6 @@ void UserMgmt::initialize_defaults() {
         std::ofstream passwd("/etc/passwd");
         if (passwd) {
             passwd << "root:x:0:0:System Administrator:/root:/bin/bash\n";
-            passwd << "sshd:x:74:74:Privilege-separated SSH:/run/sshd:/usr/sbin/nologin\n";
             passwd << "messagebus:x:18:18:D-Bus Message Daemon User:/var/run/dbus:/bin/false\n";
             passwd << "lightdm:x:620:620:Light Display Manager:/var/lib/lightdm:/bin/false\n";
         } else {
@@ -44,7 +43,6 @@ void UserMgmt::initialize_defaults() {
         std::ofstream shadow("/etc/shadow");
         if (shadow) {
             shadow << "root:" << default_root_hash() << ":19000:0:99999:7:::" << "\n";
-            shadow << "sshd:!:19000:0:99999:7:::" << "\n";
             shadow << "messagebus:!:19000:0:99999:7:::" << "\n";
             shadow << "lightdm:!:19000:0:99999:7:::" << "\n";
             shadow.close();
@@ -64,7 +62,6 @@ void UserMgmt::initialize_defaults() {
             group << "sudo:x:27:root\n";
             group << "users:x:100:\n";
             group << "messagebus:x:18:\n";
-            group << "sshd:x:74:\n";
             group << "lightdm:x:620:\n";
         } else {
             std::cerr << "[INIT] Failed to create /etc/group" << std::endl;
