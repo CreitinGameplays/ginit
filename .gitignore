@@ -2,4 +2,5 @@ SUBMODULE_GUIDE.md
 bin
 lib
 obj
- 
+build_sysroot/
+rootfs/

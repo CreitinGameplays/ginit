@@ -14,6 +14,7 @@ Ginit is the GeminiOS init system and a small set of companion utilities. The de
 ## Components
 
 - `ginit`: PID 1 plus the service-control CLI.
+  GeminiOS exposes `/sbin/init` only as the boot entrypoint; the interactive CLI is `ginit`.
 - `ginit-netcfg`: network configuration helper kept outside PID 1.
 - `login`: standalone login manager.
 - `getty`: simple TTY/login launcher.
