@@ -193,11 +193,28 @@ int UserMgmt::get_next_gid(const std::vector<Group>& groups) {
 }
 
 bool UserMgmt::is_valid_username(const std::string& username) {
-    if (username.length() < 4 || username.length() > 16) return false;
-    for (char c : username) {
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
-            return false;
+    if (username.empty() || username.length() > 32) return false;
+
+    const char first = username.front();
+    if (!((first >= 'a' && first <= 'z') || first == '_')) {
+        return false;
+    }
+
+    for (size_t index = 1; index < username.size(); ++index) {
+        const char c = username[index];
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+            continue;
         }
+        if (c == '$' && index + 1 == username.size()) {
+            continue;
+        }
+        return false;
+    }
+    if (username == "." || username == "..") {
+        return false;
+    }
+    if (username.find('/') != std::string::npos) {
+        return false;
     }
     return true;
 }

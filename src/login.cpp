@@ -154,8 +154,49 @@ void import_pam_environment(pam_handle_t* pamh) {
     free(pam_env);
 }
 
-void ensure_runtime_dir(const passwd& user) {
-    std::string runtime_dir = "/run/user/" + std::to_string(user.pw_uid);
+std::string default_runtime_dir(const passwd& user) {
+    return "/run/user/" + std::to_string(user.pw_uid);
+}
+
+std::string find_restorecon_binary() {
+    static const char* candidates[] = {
+        "/usr/sbin/restorecon",
+        "/sbin/restorecon",
+    };
+
+    for (const char* candidate : candidates) {
+        if (access(candidate, X_OK) == 0) {
+            return candidate;
+        }
+    }
+    return "";
+}
+
+void best_effort_restorecon(const std::string& path) {
+    const std::string restorecon = find_restorecon_binary();
+    if (restorecon.empty() || path.empty()) {
+        return;
+    }
+
+    const pid_t child = fork();
+    if (child == 0) {
+        execl(restorecon.c_str(), restorecon.c_str(), "-F", path.c_str(), nullptr);
+        _exit(127);
+    }
+    if (child < 0) {
+        return;
+    }
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return;
+        }
+    }
+}
+
+void ensure_runtime_dir_privileged(const passwd& user) {
+    std::string runtime_dir = default_runtime_dir(user);
     if (mkdir("/run/user", 0755) != 0 && errno != EEXIST) {
         perror("mkdir /run/user");
     }
@@ -166,7 +207,7 @@ void ensure_runtime_dir(const passwd& user) {
         perror("chown XDG_RUNTIME_DIR");
     }
     chmod(runtime_dir.c_str(), 0700);
-    setenv("XDG_RUNTIME_DIR", runtime_dir.c_str(), 1);
+    best_effort_restorecon(runtime_dir);
 }
 
 void ensure_directory_path(const std::string& path) {
@@ -234,8 +275,13 @@ void adopt_runtime_dbus_address() {
 void prepare_user_session(const passwd& user, pam_handle_t* pamh) {
     set_base_environment(user);
     import_pam_environment(pamh);
-    if (getenv("XDG_RUNTIME_DIR") == nullptr || access(getenv("XDG_RUNTIME_DIR"), F_OK) != 0) {
-        ensure_runtime_dir(user);
+
+    const std::string runtime_dir = default_runtime_dir(user);
+    const char* current_runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (!current_runtime_dir || *current_runtime_dir == '\0' || access(current_runtime_dir, F_OK) != 0) {
+        if (access(runtime_dir.c_str(), F_OK) == 0) {
+            setenv("XDG_RUNTIME_DIR", runtime_dir.c_str(), 1);
+        }
     }
     ensure_user_xdg_dirs();
     adopt_runtime_dbus_address();
@@ -249,6 +295,7 @@ int run_shell_session(const passwd& user, pam_handle_t* pamh) {
     }
 
     if (child == 0) {
+        ensure_runtime_dir_privileged(user);
         if (initgroups(user.pw_name, user.pw_gid) != 0) {
             perror("initgroups");
             _exit(1);
