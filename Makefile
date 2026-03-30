@@ -56,13 +56,13 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 install: all
-	mkdir -p $(DESTDIR)/bin $(DESTDIR)/sbin
+	mkdir -p $(DESTDIR)/bin $(DESTDIR)/sbin $(DESTDIR)/usr/bin $(DESTDIR)/usr/sbin
 	mkdir -p $(DESTDIR)/usr/lib/ginit/services
 	mkdir -p $(DESTDIR)/etc/ginit/services/system
 	cp $(BINDIR)/ginit $(DESTDIR)/bin/ginit
 	cp $(BINDIR)/ginit-netcfg $(DESTDIR)/bin/ginit-netcfg
-	cp $(BINDIR)/login $(DESTDIR)/bin/login
-	cp $(BINDIR)/getty $(DESTDIR)/sbin/getty
+	cp $(BINDIR)/login $(DESTDIR)/usr/bin/login
+	cp $(BINDIR)/getty $(DESTDIR)/usr/sbin/getty
 	cp boot-services.conf $(DESTDIR)/usr/lib/ginit/boot-services.conf
 	cp services/*.gservice $(DESTDIR)/usr/lib/ginit/services/
 	# Note: symlinks and other setup are handled by the main build script for now

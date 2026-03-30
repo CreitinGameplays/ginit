@@ -136,13 +136,13 @@ int main(int argc, char* argv[]) {
 
     // Execute login
     if (!autologin_user.empty()) {
-        char* const login_argv[] = { (char*)"/bin/login", (char*)"-f", (char*)autologin_user.c_str(), nullptr };
-        execv("/bin/login", login_argv);
+        char* const login_argv[] = { (char*)"/usr/bin/login", (char*)"-f", (char*)autologin_user.c_str(), nullptr };
+        execv("/usr/bin/login", login_argv);
     } else {
-        char* const login_argv[] = { (char*)"/bin/login", nullptr };
-        execv("/bin/login", login_argv);
+        char* const login_argv[] = { (char*)"/usr/bin/login", nullptr };
+        execv("/usr/bin/login", login_argv);
     }
 
-    perror("getty: execv /bin/login");
+    perror("getty: execv /usr/bin/login");
     return 1;
 }

@@ -889,11 +889,11 @@ pid_t spawn_getty(const char* tty, const char* autologin_user = nullptr) {
 
     if (pid == 0) {
         if (autologin_user && *autologin_user) {
-            execl("/sbin/getty", "getty", tty, autologin_user, nullptr);
+            execl("/usr/sbin/getty", "getty", tty, autologin_user, nullptr);
         } else {
-            execl("/sbin/getty", "getty", tty, nullptr);
+            execl("/usr/sbin/getty", "getty", tty, nullptr);
         }
-        perror("execv /sbin/getty");
+        perror("execv /usr/sbin/getty");
         _exit(127);
     }
 
