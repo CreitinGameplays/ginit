@@ -700,8 +700,21 @@ bool reexec_after_selinux_transition(char* argv[]) {
         return false;
     }
 
+    const std::string reexec_path = find_first_existing_path({
+        "/usr/bin/ginit",
+        "/bin/ginit",
+        argv[0],
+    });
+    if (reexec_path.empty()) {
+        return false;
+    }
+
+    if (boot_verbose_enabled()) {
+        std::cerr << "[GINIT] Re-execing PID 1 through " << reexec_path << " for SELinux domain transition." << std::endl;
+    }
+
     setenv("GINIT_SELINUX_REEXECED", "1", 1);
-    execv(argv[0], argv);
+    execv(reexec_path.c_str(), argv);
     perror("[GINIT] Failed to re-exec after SELinux policy load");
     return false;
 }
