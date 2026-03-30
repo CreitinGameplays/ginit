@@ -59,6 +59,8 @@ install: all
 	mkdir -p $(DESTDIR)/bin $(DESTDIR)/sbin $(DESTDIR)/usr/bin $(DESTDIR)/usr/sbin
 	mkdir -p $(DESTDIR)/usr/lib/ginit/services
 	mkdir -p $(DESTDIR)/etc/ginit/services/system
+	rm -f $(DESTDIR)/bin/ginit $(DESTDIR)/bin/ginit-netcfg
+	rm -f $(DESTDIR)/usr/bin/login $(DESTDIR)/usr/sbin/getty
 	cp $(BINDIR)/ginit $(DESTDIR)/bin/ginit
 	cp $(BINDIR)/ginit-netcfg $(DESTDIR)/bin/ginit-netcfg
 	cp $(BINDIR)/login $(DESTDIR)/usr/bin/login
