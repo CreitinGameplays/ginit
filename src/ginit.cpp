@@ -1,5 +1,6 @@
 #include <array>
 #include <cerrno>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <poll.h>
@@ -20,6 +21,7 @@
 #include <csignal>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <selinux/selinux.h>
 #include "signals.h"
 #include "sys_info.h"
 #include "user_mgmt.h"
@@ -629,7 +631,46 @@ int run_helper_command(const std::string& path, const std::vector<std::string>& 
     return -1;
 }
 
-void configure_selinux_runtime() {
+void best_effort_restorecon_paths(const std::vector<std::string>& paths, bool recursive) {
+    const std::string restorecon = find_first_existing_path({
+        "/usr/sbin/restorecon",
+        "/sbin/restorecon",
+    });
+    if (restorecon.empty()) {
+        return;
+    }
+
+    std::vector<std::string> args = {"-F"};
+    if (recursive) {
+        args.push_back("-R");
+    }
+    for (const auto& path : paths) {
+        if (access(path.c_str(), F_OK) == 0) {
+            args.push_back(path);
+        }
+    }
+    if (args.size() <= (recursive ? 2u : 1u)) {
+        return;
+    }
+
+    int rc = run_helper_command(restorecon, args);
+    if (rc != 0) {
+        std::cerr << "[GINIT] restorecon failed with exit code " << rc << std::endl;
+    }
+}
+
+bool reexec_after_selinux_transition(char* argv[]) {
+    if (!argv || !argv[0] || !*argv[0]) {
+        return false;
+    }
+
+    setenv("GINIT_SELINUX_REEXECED", "1", 1);
+    execv(argv[0], argv);
+    perror("[GINIT] Failed to re-exec after SELinux policy load");
+    return false;
+}
+
+void configure_selinux_runtime(char* argv[]) {
     const bool is_live = access("/etc/geminios-live", F_OK) == 0;
     const bool selinux_disabled = kernel_cmdline_has_flag("selinux=0");
 
@@ -645,40 +686,30 @@ void configure_selinux_runtime() {
         return;
     }
 
-    safe_mkdir("/sys/fs");
-    safe_mkdir("/sys/fs/selinux");
-
-    if (mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, nullptr) != 0 && errno != EBUSY) {
-        perror("[GINIT] Failed to mount /sys/fs/selinux");
-        return;
-    }
-
-    const bool want_permissive = mode == "permissive";
-
-    const std::string load_policy = find_first_existing_path({
-        "/usr/sbin/load_policy",
-        "/sbin/load_policy",
-    });
-    if (!load_policy.empty()) {
-        int rc = run_helper_command(load_policy, {});
-        if (rc != 0) {
-            std::cerr << "[GINIT] SELinux policy load failed with exit code " << rc << std::endl;
-        }
-    } else {
-        std::cerr << "[GINIT] SELinux requested but load_policy is not installed." << std::endl;
-    }
-
-    if (want_permissive) {
-        const std::string setenforce = find_first_existing_path({
-            "/usr/sbin/setenforce",
-            "/sbin/setenforce",
-        });
-        if (!setenforce.empty()) {
-            int rc = run_helper_command(setenforce, {"0"});
-            if (rc != 0) {
-                std::cerr << "[GINIT] Failed to switch SELinux to permissive mode (exit " << rc << ")." << std::endl;
+    const bool reexeced = getenv("GINIT_SELINUX_REEXECED") != nullptr;
+    if (!reexeced) {
+        int enforce = (mode == "enforcing") ? 1 : 0;
+        if (selinux_init_load_policy(&enforce) == 0) {
+            best_effort_restorecon_paths({
+                "/bin/ginit",
+                "/bin/ginit-netcfg",
+                "/sbin/init",
+                "/usr/bin/login",
+                "/usr/sbin/getty",
+                "/bin/login",
+                "/sbin/getty",
+            }, false);
+            if (reexec_after_selinux_transition(argv)) {
+                return;
             }
+        } else if (is_selinux_enabled() > 0) {
+            std::cerr << "[GINIT] SELinux policy initialization failed; continuing without PID 1 relabel transition." << std::endl;
         }
+    }
+
+    unsetenv("GINIT_SELINUX_REEXECED");
+    if (is_selinux_enabled() <= 0) {
+        return;
     }
 
     const std::string file_contexts = find_first_existing_path({
@@ -712,28 +743,17 @@ void configure_selinux_runtime() {
         }
     }
 
-    const std::string restorecon = find_first_existing_path({
-        "/usr/sbin/restorecon",
-        "/sbin/restorecon",
-    });
-    if (!restorecon.empty()) {
-        std::vector<std::string> args = {
-            "-RF",
-            "/dev",
-            "/run",
-            "/tmp",
-            "/var/log",
-            "/var/tmp",
-            "/var/lib",
-            "/home",
-            "/root",
-            "/etc",
-        };
-        int rc = run_helper_command(restorecon, args);
-        if (rc != 0) {
-            std::cerr << "[GINIT] restorecon failed with exit code " << rc << std::endl;
-        }
-    }
+    best_effort_restorecon_paths({
+        "/dev",
+        "/run",
+        "/tmp",
+        "/var/log",
+        "/var/tmp",
+        "/var/lib",
+        "/home",
+        "/root",
+        "/etc",
+    }, true);
 }
 
 // Mount filesystems and ensure target directory exists
@@ -1119,7 +1139,7 @@ int main(int argc, char* argv[]) {
     safe_mkdir("/run/user");
     safe_mkdir("/var/lib/elogind");
 
-    configure_selinux_runtime();
+    configure_selinux_runtime(argv);
 
     if (!service_manager.start_ipc_server()) {
         std::cerr << "[GINIT] IPC server could not be started early; retrying after service startup." << std::endl;
