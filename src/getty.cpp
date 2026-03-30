@@ -5,11 +5,64 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <fstream>
+#include <sstream>
 #include "sys_info.h"
 
+namespace {
+
+bool kernel_cmdline_has_token(const std::string& token) {
+    std::ifstream cmdline("/proc/cmdline");
+    if (!cmdline.is_open()) {
+        return false;
+    }
+
+    std::string content;
+    std::getline(cmdline, content);
+    std::istringstream input(content);
+    std::string current;
+    while (input >> current) {
+        if (current == token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool getty_verbose_enabled() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    if (kernel_cmdline_has_token("geminios.verbose_boot=1")) {
+        cached = 1;
+        return true;
+    }
+    if (kernel_cmdline_has_token("geminios.verbose_boot=0")) {
+        cached = 0;
+        return false;
+    }
+
+    cached = kernel_cmdline_has_token("quiet") ? 0 : 1;
+    return cached != 0;
+}
+
+void debug_log(const std::string& message) {
+    if (getty_verbose_enabled()) {
+        std::cerr << message << std::endl;
+    }
+}
+
+void debug_log_stdout(const std::string& message) {
+    if (getty_verbose_enabled()) {
+        std::cout << message << std::endl;
+    }
+}
+
+} // namespace
+
 int main(int argc, char* argv[]) {
-    // Immediate debug to console (inherited from ginit)
-    std::cerr << "[GETTY] Starting..." << std::endl;
+    debug_log("[GETTY] Starting...");
     
     if (argc < 2) {
         std::cerr << "Usage: getty <tty> [autologin_user]" << std::endl;
@@ -26,20 +79,24 @@ int main(int argc, char* argv[]) {
         tty_dev = "/dev/" + tty_dev;
     }
     
-    std::cerr << "[GETTY] Target TTY: " << tty_dev << std::endl;
-    std::cerr << std::flush;
+    if (getty_verbose_enabled()) {
+        std::cerr << "[GETTY] Target TTY: " << tty_dev << std::endl;
+        std::cerr << std::flush;
+    }
 
     // Open TTY
     // Use O_NOCTTY to avoid acquiring it as controlling tty immediately
     // We will do it manually with TIOCSCTTY
-    std::cerr << "[GETTY] Opening " << tty_dev << "..." << std::endl;
-    std::cerr << std::flush;
+    if (getty_verbose_enabled()) {
+        std::cerr << "[GETTY] Opening " << tty_dev << "..." << std::endl;
+        std::cerr << std::flush;
+    }
     int fd = open(tty_dev.c_str(), O_RDWR | O_NOCTTY);
     if (fd < 0) {
         perror("[GETTY] open tty failed");
         return 1;
     }
-    std::cerr << "[GETTY] Opened " << tty_dev << " (fd: " << fd << ")" << std::endl;
+    debug_log("[GETTY] Opened " + tty_dev + " (fd: " + std::to_string(fd) + ")");
 
     // Set TERM environment variable
     setenv("TERM", "linux", 1);
@@ -50,7 +107,7 @@ int main(int argc, char* argv[]) {
     if (ioctl(fd, TIOCSCTTY, 1) < 0) {
         perror("getty: ioctl TIOCSCTTY");
     }
-    std::cerr << "[GETTY] Controlling terminal set." << std::endl;
+    debug_log("[GETTY] Controlling terminal set.");
 
     // Setup standard FDs
     dup2(fd, STDIN_FILENO);
@@ -66,7 +123,7 @@ int main(int argc, char* argv[]) {
         close(kmsg);
     }
     
-    std::cout << "[GETTY] Banner printing..." << std::endl;
+    debug_log_stdout("[GETTY] Banner printing...");
 
     // Basic termios setup (similar to ginit's previous logic)
     struct termios t;

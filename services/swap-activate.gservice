@@ -1,0 +1,20 @@
+service "swap-activate" {
+    meta {
+        description = "Activate swap devices from fstab"
+        deps {
+            after = ["udev-settle"]
+            requires = ["udev-settle"]
+        }
+    }
+
+    process {
+        type = "oneshot"
+        commands {
+            start = "if command -v swapon >/dev/null 2>&1; then swapon -a; fi"
+        }
+    }
+
+    install {
+        wanted_by = ["multi-user.target"]
+    }
+}

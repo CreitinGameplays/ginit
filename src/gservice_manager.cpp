@@ -26,6 +26,48 @@ namespace {
 
 constexpr useconds_t kStopPollIntervalUs = 50000;
 
+bool kernel_cmdline_has_token(std::string_view token) {
+    std::ifstream cmdline("/proc/cmdline");
+    if (!cmdline.is_open()) {
+        return false;
+    }
+
+    std::string content;
+    std::getline(cmdline, content);
+    std::istringstream input(content);
+    std::string current;
+    while (input >> current) {
+        if (current == token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool info_console_logging_enabled() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    if (getpid() != 1) {
+        cached = 1;
+        return true;
+    }
+
+    if (kernel_cmdline_has_token("geminios.verbose_boot=1")) {
+        cached = 1;
+        return true;
+    }
+    if (kernel_cmdline_has_token("geminios.verbose_boot=0")) {
+        cached = 0;
+        return false;
+    }
+
+    cached = kernel_cmdline_has_token("quiet") ? 0 : 1;
+    return cached != 0;
+}
+
 void log_with_stream(FILE* stream, const char* level, const std::string& msg) {
     std::time_t now = std::time(nullptr);
     struct tm tm_now {};
@@ -42,7 +84,9 @@ void log_with_stream(FILE* stream, const char* level, const std::string& msg) {
 }
 
 void log_message(const std::string& msg) {
-    log_with_stream(stdout, nullptr, msg);
+    if (info_console_logging_enabled()) {
+        log_with_stream(stdout, nullptr, msg);
+    }
 }
 
 void log_error(const std::string& msg) {

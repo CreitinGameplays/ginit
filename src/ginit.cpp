@@ -600,6 +600,31 @@ bool kernel_cmdline_has_flag(const std::string& flag) {
     return false;
 }
 
+bool boot_verbose_enabled() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    if (kernel_cmdline_has_flag("geminios.verbose_boot=1")) {
+        cached = 1;
+        return true;
+    }
+    if (kernel_cmdline_has_flag("geminios.verbose_boot=0")) {
+        cached = 0;
+        return false;
+    }
+
+    cached = kernel_cmdline_has_flag("quiet") ? 0 : 1;
+    return cached != 0;
+}
+
+void boot_log_info(const std::string& message) {
+    if (boot_verbose_enabled()) {
+        std::cout << message << std::endl;
+    }
+}
+
 int run_helper_command(const std::string& path, const std::vector<std::string>& args) {
     pid_t pid = fork();
     if (pid < 0) {
@@ -659,6 +684,17 @@ void best_effort_restorecon_paths(const std::vector<std::string>& paths, bool re
     }
 }
 
+std::string current_selinux_context() {
+    char* context = nullptr;
+    if (getcon(&context) != 0 || !context) {
+        return "";
+    }
+
+    std::string result = context;
+    freecon(context);
+    return result;
+}
+
 bool reexec_after_selinux_transition(char* argv[]) {
     if (!argv || !argv[0] || !*argv[0]) {
         return false;
@@ -688,11 +724,20 @@ void configure_selinux_runtime(char* argv[]) {
 
     const bool reexeced = getenv("GINIT_SELINUX_REEXECED") != nullptr;
     if (!reexeced) {
+        if (boot_verbose_enabled()) {
+            const std::string before = current_selinux_context();
+            if (!before.empty()) {
+                std::cerr << "[GINIT] SELinux context before policy load: " << before << std::endl;
+            }
+        }
         int enforce = (mode == "enforcing") ? 1 : 0;
         if (selinux_init_load_policy(&enforce) == 0) {
             best_effort_restorecon_paths({
+                "/usr/bin/ginit",
+                "/usr/bin/ginit-netcfg",
                 "/bin/ginit",
                 "/bin/ginit-netcfg",
+                "/usr/sbin/init",
                 "/sbin/init",
                 "/usr/bin/login",
                 "/usr/sbin/getty",
@@ -710,6 +755,13 @@ void configure_selinux_runtime(char* argv[]) {
     unsetenv("GINIT_SELINUX_REEXECED");
     if (is_selinux_enabled() <= 0) {
         return;
+    }
+
+    if (boot_verbose_enabled()) {
+        const std::string after = current_selinux_context();
+        if (!after.empty()) {
+            std::cerr << "[GINIT] SELinux context after policy load: " << after << std::endl;
+        }
     }
 
     const std::string file_contexts = find_first_existing_path({
@@ -736,7 +788,7 @@ void configure_selinux_runtime(char* argv[]) {
             int rc = run_helper_command(setfiles, args);
             if (rc == 0) {
                 unlink("/.autorelabel");
-                std::cout << "[GINIT] Completed SELinux relabel pass." << std::endl;
+                boot_log_info("[GINIT] Completed SELinux relabel pass.");
             } else {
                 std::cerr << "[GINIT] SELinux relabel pass failed with exit code " << rc << std::endl;
             }
@@ -760,10 +812,10 @@ void configure_selinux_runtime(char* argv[]) {
 void mount_fs(const char* source, const char* target, const char* fs_type) {
     mkdir(target, 0755);
     if (mount(source, target, fs_type, 0, NULL) == 0) {
-        std::cout << "[OK] Mounted " << target << std::endl;
+        boot_log_info(std::string("[OK] Mounted ") + target);
     } else {
         if (errno == EBUSY) {
-            std::cout << "[OK] " << target << " already mounted" << std::endl;
+            boot_log_info(std::string("[OK] ") + target + " already mounted");
         } else {
             perror((std::string("[ERR] Failed to mount ") + target).c_str());
         }
@@ -785,7 +837,7 @@ void ensure_fhs() {
         "/mnt", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", 
         "/sys", "/tmp", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/locale", "/usr/lib/gconv", "/usr/local", 
         "/usr/share", "/var", "/var/lib", "/var/log", "/var/tmp", "/var/repo",
-        "/sys/fs", "/sys/fs/selinux",
+        "/sys/fs",
         "/run/lock", "/run/user", "/run/systemd", "/run/systemd/inhibit", "/run/systemd/seats",
         "/run/systemd/sessions", "/run/systemd/users", "/var/lib/elogind",
         "/usr/share/X11", "/usr/share/X11/xkb", "/usr/share/X11/xkb/compiled"
@@ -830,7 +882,7 @@ void generate_os_release() {
             f << "SUPPORT_URL=\"" << release["SUPPORT_URL"] << "\"\n";
             f << "BUG_REPORT_URL=\"" << release["BUG_REPORT_URL"] << "\"\n";
             f.close();
-            std::cout << "[GINIT] Generated fallback /etc/os-release" << std::endl;
+            boot_log_info("[GINIT] Generated fallback /etc/os-release");
         }
     }
 
@@ -845,7 +897,7 @@ void generate_os_release() {
         lsb << "DISTRIB_CODENAME=" << codename << "\n";
         lsb << "DISTRIB_DESCRIPTION=\"" << pretty_name << "\"\n";
         lsb.close();
-        std::cout << "[GINIT] Generated /etc/lsb-release" << std::endl;
+        boot_log_info("[GINIT] Generated /etc/lsb-release");
     }
 
     if (access("/etc/hostname", F_OK) == -1) {
@@ -854,7 +906,7 @@ void generate_os_release() {
             hn << "geminios-pc\n";
             hn.close();
             sethostname("geminios-pc", 11);
-            std::cout << "[GINIT] Set hostname to geminios-pc" << std::endl;
+            boot_log_info("[GINIT] Set hostname to geminios-pc");
         }
     } else {
         std::ifstream hn("/etc/hostname");
@@ -967,7 +1019,9 @@ void reap_children(std::array<TtySupervisor, 4>& terminals, bool is_live) {
             if (service_manager.is_managed_process(pid)) {
                 service_manager.handle_process_death(pid, status);
             } else if (!handle_tty_exit(pid, terminals, is_live)) {
-                std::cerr << "[GINIT] Reaped untracked child PID " << pid << std::endl;
+                if (boot_verbose_enabled()) {
+                    std::cerr << "[GINIT] Reaped untracked child PID " << pid << std::endl;
+                }
             }
             continue;
         }
@@ -1145,13 +1199,19 @@ int main(int argc, char* argv[]) {
         std::cerr << "[GINIT] IPC server could not be started early; retrying after service startup." << std::endl;
     }
 
-    std::cerr << "[GINIT] Loading enabled system services..." << std::endl;
+    if (boot_verbose_enabled()) {
+        std::cerr << "[GINIT] Loading enabled system services..." << std::endl;
+    }
     service_manager.load_services_from_dir(SYSTEM_SERVICES_DIR, true);
 
-    std::cerr << "[GINIT] Applying boot presets..." << std::endl;
+    if (boot_verbose_enabled()) {
+        std::cerr << "[GINIT] Applying boot presets..." << std::endl;
+    }
     apply_boot_presets(service_manager);
 
-    std::cerr << "[GINIT] Starting system services..." << std::endl;
+    if (boot_verbose_enabled()) {
+        std::cerr << "[GINIT] Starting system services..." << std::endl;
+    }
     service_manager.start_enabled_services();
     if (service_manager.ipc_server_fd() < 0 && !service_manager.start_ipc_server()) {
         std::cerr << "[GINIT] IPC server could not be started; CLI control will be unavailable." << std::endl;
