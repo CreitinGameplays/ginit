@@ -580,6 +580,24 @@ std::string find_first_existing_path(const std::vector<std::string>& candidates)
     return "";
 }
 
+bool kernel_cmdline_has_flag(const std::string& flag) {
+    std::ifstream cmdline("/proc/cmdline");
+    if (!cmdline.is_open()) {
+        return false;
+    }
+
+    std::string content;
+    std::getline(cmdline, content);
+    std::istringstream input(content);
+    std::string token;
+    while (input >> token) {
+        if (token == flag) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int run_helper_command(const std::string& path, const std::vector<std::string>& args) {
     pid_t pid = fork();
     if (pid < 0) {
@@ -613,6 +631,11 @@ int run_helper_command(const std::string& path, const std::vector<std::string>& 
 
 void configure_selinux_runtime() {
     const bool is_live = access("/etc/geminios-live", F_OK) == 0;
+    const bool selinux_disabled = kernel_cmdline_has_flag("selinux=0");
+
+    if (is_live || selinux_disabled) {
+        return;
+    }
 
     auto config = load_os_release_fields("/etc/selinux/config");
     std::string mode = to_lower_copy_local(release_field_or(config, "SELINUX", "disabled"));
@@ -630,7 +653,7 @@ void configure_selinux_runtime() {
         return;
     }
 
-    const bool want_permissive = is_live || mode == "permissive";
+    const bool want_permissive = mode == "permissive";
 
     const std::string load_policy = find_first_existing_path({
         "/usr/sbin/load_policy",
@@ -646,9 +669,6 @@ void configure_selinux_runtime() {
     }
 
     if (want_permissive) {
-        if (is_live) {
-            std::cout << "[GINIT] Live environment detected; forcing SELinux permissive mode." << std::endl;
-        }
         const std::string setenforce = find_first_existing_path({
             "/usr/sbin/setenforce",
             "/sbin/setenforce",
@@ -659,11 +679,6 @@ void configure_selinux_runtime() {
                 std::cerr << "[GINIT] Failed to switch SELinux to permissive mode (exit " << rc << ")." << std::endl;
             }
         }
-    }
-
-    if (is_live) {
-        std::cout << "[GINIT] Live environment detected; skipping SELinux relabel and restorecon passes." << std::endl;
-        return;
     }
 
     const std::string file_contexts = find_first_existing_path({

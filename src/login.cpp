@@ -7,6 +7,8 @@
 #include <pwd.h>
 #include <security/pam_appl.h>
 #include <security/pam_misc.h>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -158,6 +160,24 @@ std::string default_runtime_dir(const passwd& user) {
     return "/run/user/" + std::to_string(user.pw_uid);
 }
 
+bool kernel_cmdline_has_flag(const std::string& flag) {
+    std::ifstream cmdline("/proc/cmdline");
+    if (!cmdline.is_open()) {
+        return false;
+    }
+
+    std::string content;
+    std::getline(cmdline, content);
+    std::istringstream input(content);
+    std::string token;
+    while (input >> token) {
+        if (token == flag) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string find_restorecon_binary() {
     static const char* candidates[] = {
         "/usr/sbin/restorecon",
@@ -173,6 +193,10 @@ std::string find_restorecon_binary() {
 }
 
 void best_effort_restorecon(const std::string& path) {
+    if (access("/etc/geminios-live", F_OK) == 0 || kernel_cmdline_has_flag("selinux=0")) {
+        return;
+    }
+
     const std::string restorecon = find_restorecon_binary();
     if (restorecon.empty() || path.empty()) {
         return;
