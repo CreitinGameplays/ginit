@@ -29,6 +29,7 @@
 #include <atomic>
 #include <cmath>
 #include <numeric>
+#include <sstream>
 #include <unordered_map>
 
 // QEMU Default Network Settings
@@ -38,6 +39,83 @@
 #define DNS_SERVER "10.0.2.3" // QEMU User Network DNS
 
 #include <ifaddrs.h>
+
+namespace {
+
+std::string TrimWhitespace(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+        ++start;
+    }
+
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+
+    return value.substr(start, end - start);
+}
+
+std::string GetConfiguredHostname() {
+    std::ifstream hostname_file("/etc/hostname");
+    std::string hostname;
+
+    if (hostname_file && std::getline(hostname_file, hostname)) {
+        hostname = TrimWhitespace(hostname);
+        if (!hostname.empty()) {
+            return hostname;
+        }
+    }
+
+    char current_hostname[256] = {};
+    if (gethostname(current_hostname, sizeof(current_hostname)) == 0 && current_hostname[0] != '\0') {
+        return current_hostname;
+    }
+
+    return "geminios-pc";
+}
+
+bool HostsFileMatchesHostname(const std::string& hostname) {
+    std::ifstream hosts("/etc/hosts");
+    if (!hosts) {
+        return false;
+    }
+
+    bool has_localhost = false;
+    bool has_hostname = false;
+    const std::string fqdn = hostname + ".localdomain";
+    std::string line;
+
+    while (std::getline(hosts, line)) {
+        size_t comment = line.find('#');
+        if (comment != std::string::npos) {
+            line.erase(comment);
+        }
+
+        line = TrimWhitespace(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string address;
+        iss >> address;
+
+        std::string alias;
+        while (iss >> alias) {
+            if (alias == "localhost") {
+                has_localhost = true;
+            }
+            if (alias == hostname || alias == fqdn) {
+                has_hostname = true;
+            }
+        }
+    }
+
+    return has_localhost && has_hostname;
+}
+
+} // namespace
 
 std::string GetFirstInterface() {
     struct ifaddrs *ifaddr, *ifa;
@@ -65,6 +143,7 @@ std::string GetFirstInterface() {
 
 int ConfigureNetwork() {
     std::string iface = GetFirstInterface();
+    std::string hostname = GetConfiguredHostname();
     std::cout << "[NET] Using interface: " << iface << std::endl;
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -147,14 +226,18 @@ int ConfigureNetwork() {
     }
 
     // 5. Generate /etc/hosts
-    std::ofstream hosts("/etc/hosts");
-    if (hosts) {
-        hosts << "127.0.0.1\tlocalhost\n";
-        hosts << "127.0.1.1\tgeminios-pc\n";
-        hosts << MY_IP << "\tgeminios-pc\n";
-        hosts << "::1\tlocalhost ip6-localhost ip6-loopback\n";
-        hosts.close();
-        std::cout << "[NET] Generated /etc/hosts" << std::endl;
+    if (HostsFileMatchesHostname(hostname)) {
+        std::cout << "[NET] Keeping existing /etc/hosts for hostname " << hostname << std::endl;
+    } else {
+        std::ofstream hosts("/etc/hosts");
+        if (hosts) {
+            hosts << "127.0.0.1\tlocalhost\n";
+            hosts << "127.0.1.1\t" << hostname << ".localdomain " << hostname << "\n";
+            hosts << MY_IP << "\t" << hostname << "\n";
+            hosts << "::1\tlocalhost ip6-localhost ip6-loopback\n";
+            hosts.close();
+            std::cout << "[NET] Generated /etc/hosts for hostname " << hostname << std::endl;
+        }
     }
 
     std::cout << "[NET] Network Configured: " << MY_IP << " (DNS: " << DNS_SERVER << ")" << std::endl;
