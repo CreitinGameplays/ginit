@@ -80,6 +80,10 @@ bool has_gservice_suffix(const std::string& filename) {
     return filename.size() > 9 && filename.substr(filename.size() - 9) == ".gservice";
 }
 
+bool is_live_environment() {
+    return access("/etc/geminios-live", F_OK) == 0;
+}
+
 std::string basename_copy_local(const char* path) {
     if (!path || !*path) {
         return "";
@@ -720,7 +724,7 @@ bool reexec_after_selinux_transition(char* argv[]) {
 }
 
 void configure_selinux_runtime(char* argv[]) {
-    const bool is_live = access("/etc/geminios-live", F_OK) == 0;
+    const bool is_live = is_live_environment();
     const bool selinux_disabled = kernel_cmdline_has_flag("selinux=0");
 
     if (is_live || selinux_disabled) {
@@ -929,7 +933,16 @@ void generate_os_release() {
 
     std::ofstream issue("/etc/issue");
     if (issue) {
-        issue << pretty_name << "\n\\l\n\n";
+        if (is_live_environment()) {
+            issue << pretty_name << " Live Session\n";
+            issue << "Host: \\n\n";
+            issue << "Welcome to " << pretty_name << ".\n";
+            issue << "You are running the system from live media.\n";
+            issue << "Run 'installer' as root to install " << OS_NAME << " to disk.\n";
+            issue << "TTY: \\l\n\n";
+        } else {
+            issue << pretty_name << "\n\\l\n\n";
+        }
         issue.close();
     }
 }
@@ -1237,7 +1250,7 @@ int main(int argc, char* argv[]) {
         {"/dev/ttyS0", -1},
     }};
 
-    const bool is_live = (access("/etc/geminios-live", F_OK) == 0);
+    const bool is_live = is_live_environment();
     for (auto& tty : terminals) {
         ensure_tty_running(tty, is_live);
     }
