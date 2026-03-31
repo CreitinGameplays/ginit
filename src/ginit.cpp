@@ -877,10 +877,11 @@ void generate_os_release() {
         release["VERSION"] = OS_VERSION;
         release["ID"] = OS_ID;
         release["ID_LIKE"] = OS_ID_LIKE;
-        release["PRETTY_NAME"] = std::string(OS_NAME) + " " + OS_VERSION;
+        release["PRETTY_NAME"] = OS_NAME;
         release["VERSION_ID"] = OS_VERSION_ID;
         release["VERSION_CODENAME"] = OS_CODENAME;
         release["ANSI_COLOR"] = OS_ANSI_COLOR;
+        release["LOGO"] = "distributor-logo-geminios";
         release["HOME_URL"] = "https://github.com/CreitinGameplays/geminios";
         release["SUPPORT_URL"] = "https://github.com/CreitinGameplays/geminios/issues";
         release["BUG_REPORT_URL"] = "https://github.com/CreitinGameplays/geminios/issues";
@@ -895,6 +896,7 @@ void generate_os_release() {
             f << "VERSION_ID=\"" << release["VERSION_ID"] << "\"\n";
             f << "VERSION_CODENAME=\"" << release["VERSION_CODENAME"] << "\"\n";
             f << "ANSI_COLOR=\"" << release["ANSI_COLOR"] << "\"\n";
+            f << "LOGO=\"" << release["LOGO"] << "\"\n";
             f << "HOME_URL=\"" << release["HOME_URL"] << "\"\n";
             f << "SUPPORT_URL=\"" << release["SUPPORT_URL"] << "\"\n";
             f << "BUG_REPORT_URL=\"" << release["BUG_REPORT_URL"] << "\"\n";
