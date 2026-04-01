@@ -20,6 +20,81 @@ struct BootstrapAccount {
     const char* shell;
 };
 
+struct BootstrapGroup {
+    const char* name;
+    gid_t gid;
+    const char* members;
+};
+
+constexpr BootstrapGroup kBaseGroups[] = {
+    {"root", 0, ""},
+    {"daemon", 1, ""},
+    {"bin", 2, ""},
+    {"sys", 3, ""},
+    {"adm", 4, ""},
+    {"tty", 5, ""},
+    {"disk", 6, ""},
+    {"lp", 7, ""},
+    {"mail", 8, ""},
+    {"news", 9, ""},
+    {"uucp", 10, ""},
+    {"man", 12, ""},
+    {"proxy", 13, ""},
+    {"kmem", 15, ""},
+    {"dialout", 20, ""},
+    {"fax", 21, ""},
+    {"voice", 22, ""},
+    {"cdrom", 24, ""},
+    {"floppy", 25, ""},
+    {"tape", 26, ""},
+    {"sudo", 27, "root"},
+    {"audio", 29, ""},
+    {"dip", 30, ""},
+    {"www-data", 33, ""},
+    {"backup", 34, ""},
+    {"operator", 37, ""},
+    {"list", 38, ""},
+    {"irc", 39, ""},
+    {"src", 40, ""},
+    {"shadow", 42, ""},
+    {"utmp", 43, ""},
+    {"video", 44, ""},
+    {"sasl", 45, ""},
+    {"plugdev", 46, ""},
+    {"staff", 50, ""},
+    {"games", 60, ""},
+    {"kvm", 78, ""},
+    {"power", 98, ""},
+    {"storage", 99, ""},
+    {"users", 100, ""},
+    {"input", 101, ""},
+    {"render", 102, ""},
+    {"sgx", 103, ""},
+    {"netdev", 106, ""},
+    {"systemd-journal", 190, ""},
+    {"nogroup", 65534, ""},
+};
+
+constexpr BootstrapAccount kBaseAccounts[] = {
+    {"daemon", 1, 1, "daemon", "/usr/sbin", "/usr/sbin/nologin"},
+    {"bin", 2, 2, "bin", "/bin", "/usr/sbin/nologin"},
+    {"sys", 3, 3, "sys", "/dev", "/usr/sbin/nologin"},
+    {"sync", 4, 65534, "sync", "/bin", "/bin/sync"},
+    {"games", 5, 60, "games", "/usr/games", "/usr/sbin/nologin"},
+    {"man", 6, 12, "man", "/var/cache/man", "/usr/sbin/nologin"},
+    {"lp", 7, 7, "lp", "/var/spool/lpd", "/usr/sbin/nologin"},
+    {"mail", 8, 8, "mail", "/var/mail", "/usr/sbin/nologin"},
+    {"news", 9, 9, "news", "/var/spool/news", "/usr/sbin/nologin"},
+    {"uucp", 10, 10, "uucp", "/var/spool/uucp", "/usr/sbin/nologin"},
+    {"proxy", 13, 13, "proxy", "/bin", "/usr/sbin/nologin"},
+    {"www-data", 33, 33, "www-data", "/var/www", "/usr/sbin/nologin"},
+    {"backup", 34, 34, "backup", "/var/backups", "/usr/sbin/nologin"},
+    {"list", 38, 38, "Mailing List Manager", "/var/list", "/usr/sbin/nologin"},
+    {"irc", 39, 39, "ircd", "/run/ircd", "/usr/sbin/nologin"},
+    {"_apt", 42, 65534, "", "/nonexistent", "/usr/sbin/nologin"},
+    {"nobody", 65534, 65534, "nobody", "/nonexistent", "/usr/sbin/nologin"},
+};
+
 constexpr BootstrapAccount kServiceAccounts[] = {
     {"messagebus", 18, 18, "D-Bus Message Daemon User", "/var/run/dbus", "/bin/false"},
     {"lightdm", 620, 620, "Light Display Manager", "/var/lib/lightdm", "/bin/false"},
@@ -115,6 +190,10 @@ void UserMgmt::initialize_defaults() {
         std::ofstream passwd("/etc/passwd");
         if (passwd) {
             passwd << "root:x:0:0:System Administrator:/root:/bin/bash\n";
+            for (const auto& account : kBaseAccounts) {
+                passwd << account.username << ":x:" << account.uid << ":" << account.gid << ":"
+                       << account.gecos << ":" << account.home << ":" << account.shell << "\n";
+            }
             for (const auto& account : kServiceAccounts) {
                 passwd << account.username << ":x:" << account.uid << ":" << account.gid << ":"
                        << account.gecos << ":" << account.home << ":" << account.shell << "\n";
@@ -129,6 +208,9 @@ void UserMgmt::initialize_defaults() {
         std::ofstream shadow("/etc/shadow");
         if (shadow) {
             shadow << "root:" << default_root_hash() << ":19000:0:99999:7:::" << "\n";
+            for (const auto& account : kBaseAccounts) {
+                shadow << account.username << ":!:19000:0:99999:7:::" << "\n";
+            }
             for (const auto& account : kServiceAccounts) {
                 shadow << account.username << ":!:19000:0:99999:7:::" << "\n";
             }
@@ -145,9 +227,9 @@ void UserMgmt::initialize_defaults() {
         std::cout << "[INIT] Creating default /etc/group..." << std::endl;
         std::ofstream group("/etc/group");
         if (group) {
-            group << "root:x:0:\n";
-            group << "sudo:x:27:root\n";
-            group << "users:x:100:\n";
+            for (const auto& entry : kBaseGroups) {
+                group << entry.name << ":x:" << entry.gid << ":" << entry.members << "\n";
+            }
             for (const auto& account : kServiceAccounts) {
                 group << account.username << ":x:" << account.gid << ":\n";
             }
@@ -156,6 +238,19 @@ void UserMgmt::initialize_defaults() {
         }
     }
 
+    for (const auto& account : kBaseAccounts) {
+        append_line_if_missing("/etc/passwd", account.username,
+                               std::string(account.username) + ":x:" + std::to_string(account.uid) +
+                                   ":" + std::to_string(account.gid) + ":" + account.gecos + ":" +
+                                   account.home + ":" + account.shell);
+        append_line_if_missing("/etc/shadow", account.username,
+                               std::string(account.username) + ":!:19000:0:99999:7:::");
+    }
+    for (const auto& entry : kBaseGroups) {
+        append_line_if_missing("/etc/group", entry.name,
+                               std::string(entry.name) + ":x:" + std::to_string(entry.gid) +
+                                   ":" + entry.members);
+    }
     for (const auto& account : kServiceAccounts) {
         append_line_if_missing("/etc/passwd", account.username,
                                std::string(account.username) + ":x:" + std::to_string(account.uid) +
