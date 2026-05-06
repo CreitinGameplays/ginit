@@ -628,6 +628,10 @@ bool GServiceParser::Parser::parse_process(GService& service) {
             if (!parse_value(service.work_dir)) {
                 return false;
             }
+        } else if (key == "failure_is_fatal") {
+            if (!parse_bool_value(service.failure_is_fatal)) {
+                return false;
+            }
         } else if (!skip_value()) {
             return false;
         }

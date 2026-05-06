@@ -9,6 +9,7 @@ service "swap-activate" {
 
     process {
         type = "oneshot"
+        failure_is_fatal = false
         commands {
             start = "if command -v swapon >/dev/null 2>&1; then swapon -a; fi"
         }

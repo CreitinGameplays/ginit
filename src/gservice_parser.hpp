@@ -39,6 +39,7 @@ struct GService {
     std::string start;
     std::string stop;
     bool no_new_privileges = false;
+    bool failure_is_fatal = true;
     ServiceType type = ServiceType::Simple;
     RestartPolicy restart_policy = RestartPolicy::Never;
     uint32_t restart_delay_us = 0;

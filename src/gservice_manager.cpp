@@ -723,6 +723,13 @@ std::string GServiceManager::start_service(const std::string& name) {
             return "Oneshot " + name + " finished successfully.\n";
         }
 
+        if (!service->config.failure_is_fatal) {
+            service->finished_successfully = true;
+            service->last_result = wait_status_to_string(status) + " (ignored)";
+            log_message("[GSERVICE] Oneshot " + name + " completed with " + wait_status_to_string(status) + " (ignored).");
+            return "Oneshot " + name + " completed with " + wait_status_to_string(status) + " (ignored).\n";
+        }
+
         service->finished_successfully = false;
         service->last_result = wait_status_to_string(status);
         log_error("[GSERVICE] Oneshot " + name + " failed with " + wait_status_to_string(status));
@@ -930,13 +937,19 @@ void GServiceManager::handle_process_death(pid_t pid, int status) {
     service->running = false;
     service->pid = -1;
     service->starting = false;
-    service->last_result = wait_status_to_string(status);
 
     log_message("[GSERVICE] Service " + name + " (" + std::to_string(pid) + ") exited with " + wait_status_to_string(status));
 
     if (service->config.type == ServiceType::Oneshot) {
-        service->finished_successfully = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        const bool exited_cleanly = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        service->finished_successfully = exited_cleanly || !service->config.failure_is_fatal;
         service->stopping = false;
+        if (!exited_cleanly && !service->config.failure_is_fatal) {
+            service->last_result = wait_status_to_string(status) + " (ignored)";
+            log_message("[GSERVICE] Oneshot " + name + " exited with " + wait_status_to_string(status) + " (ignored).");
+        } else {
+            service->last_result = wait_status_to_string(status);
+        }
         return;
     }
 
@@ -1008,6 +1021,8 @@ std::string GServiceManager::detail_for_service(const ServiceState& service) con
     } else {
         out += "never\n";
     }
+    out += "  Failure is fatal: ";
+    out += service.config.failure_is_fatal ? "Yes\n" : "No\n";
     if (service.config.restart_delay_us > 0) {
         out += "  Restart delay: " + std::to_string(service.config.restart_delay_us / 1000U) + " ms\n";
     }

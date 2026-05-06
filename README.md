@@ -55,6 +55,8 @@ service "dbus" {
 }
 ```
 
+For best-effort oneshot helpers that should not block boot, set `failure_is_fatal = false` inside `process`.
+
 ## Boot Presets
 
 `/usr/lib/ginit/boot-services.conf` is the vendor default list. `/etc/ginit/boot-services.conf` is merged after it.
