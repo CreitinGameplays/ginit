@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <sstream>
 #include <fstream>
+#include <cstdio>
 #include <csignal>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <selinux/selinux.h>
 #include "signals.h"
@@ -586,6 +588,19 @@ std::string find_first_existing_path(const std::vector<std::string>& candidates)
     return "";
 }
 
+std::string wait_status_to_string_local(int status) {
+    if (WIFEXITED(status)) {
+        return "exit " + std::to_string(WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+        return "signal " + std::to_string(WTERMSIG(status));
+    }
+    if (WIFSTOPPED(status)) {
+        return "stopped by signal " + std::to_string(WSTOPSIG(status));
+    }
+    return "status " + std::to_string(status);
+}
+
 bool kernel_cmdline_has_flag(const std::string& flag) {
     std::ifstream cmdline("/proc/cmdline");
     if (!cmdline.is_open()) {
@@ -757,9 +772,8 @@ void configure_selinux_runtime(char* argv[]) {
                 "/usr/sbin/init",
                 "/sbin/init",
                 "/usr/bin/login",
-                "/usr/sbin/getty",
-                "/bin/login",
-                "/sbin/getty",
+                "/usr/sbin/agetty",
+                "/sbin/agetty",
             }, false);
             if (reexec_after_selinux_transition(argv)) {
                 return;
@@ -952,6 +966,8 @@ void generate_os_release() {
 struct TtySupervisor {
     const char* tty = nullptr;
     pid_t pid = -1;
+    int failure_count = 0;
+    bool emergency_shell = false;
 };
 
 bool install_signal_handler(int sig, void (*handler)(int)) {
@@ -996,19 +1012,108 @@ bool ensure_symlink(const char* target, const char* linkpath) {
 }
 
 pid_t spawn_getty(const char* tty, const char* autologin_user = nullptr) {
+    const std::string agetty_path = find_first_existing_path({
+        "/usr/sbin/agetty",
+        "/sbin/agetty",
+    });
+    if (!agetty_path.empty()) {
+        std::string line = tty ? tty : "";
+        if (line.rfind("/dev/", 0) == 0) {
+            line.erase(0, 5);
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror(("[GINIT] fork failed while spawning agetty for " + std::string(tty)).c_str());
+            return -1;
+        }
+
+        if (pid == 0) {
+            std::vector<std::string> args_storage;
+            args_storage.push_back("agetty");
+            args_storage.push_back("--noclear");
+            args_storage.push_back("--keep-baud");
+            args_storage.push_back("--login-program");
+            args_storage.push_back("/usr/bin/login");
+            if (autologin_user && *autologin_user) {
+                args_storage.push_back("--autologin");
+                args_storage.push_back(autologin_user);
+            }
+            args_storage.push_back(line);
+            args_storage.push_back("115200,38400,9600");
+            args_storage.push_back("linux");
+
+            std::vector<char*> argv;
+            argv.reserve(args_storage.size() + 1);
+            for (auto& arg : args_storage) {
+                argv.push_back(const_cast<char*>(arg.c_str()));
+            }
+            argv.push_back(nullptr);
+
+            execv(agetty_path.c_str(), argv.data());
+            perror(("execv " + agetty_path).c_str());
+            _exit(127);
+        }
+
+        return pid;
+    }
+
+    std::cerr << "[GINIT] util-linux agetty not found; refusing to spawn legacy getty fallback." << std::endl;
+    errno = ENOENT;
+    return -1;
+}
+
+pid_t spawn_emergency_shell(const char* tty) {
+    const std::string shell_path = find_first_existing_path({
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/sh",
+        "/usr/bin/sh",
+    });
+    if (shell_path.empty()) {
+        errno = ENOENT;
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
-        perror(("[GINIT] fork failed while spawning getty for " + std::string(tty)).c_str());
+        perror(("[GINIT] fork failed while spawning emergency shell for " + std::string(tty)).c_str());
         return -1;
     }
 
     if (pid == 0) {
-        if (autologin_user && *autologin_user) {
-            execl("/usr/sbin/getty", "getty", tty, autologin_user, nullptr);
-        } else {
-            execl("/usr/sbin/getty", "getty", tty, nullptr);
+        const int fd = open(tty, O_RDWR | O_NOCTTY);
+        if (fd < 0) {
+            perror(("[GINIT] open failed while spawning emergency shell for " + std::string(tty)).c_str());
+            _exit(127);
         }
-        perror("execv /usr/sbin/getty");
+
+        setsid();
+        if (ioctl(fd, TIOCSCTTY, 1) < 0) {
+            perror("[GINIT] ioctl TIOCSCTTY failed for emergency shell");
+        }
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if (fd > STDERR_FILENO) {
+            close(fd);
+        }
+
+        setenv("USER", "root", 1);
+        setenv("LOGNAME", "root", 1);
+        setenv("HOME", "/root", 1);
+        setenv("SHELL", shell_path.c_str(), 1);
+        setenv("PATH", "/bin/apps/system:/bin/apps:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin", 1);
+
+        std::fprintf(stderr, "\n[GINIT] Emergency console started on %s.\n", tty);
+
+        const char* shell_name = shell_path.find("bash") != std::string::npos ? "bash" : "sh";
+        if (shell_path.find("bash") != std::string::npos) {
+            execl(shell_path.c_str(), shell_name, "-l", nullptr);
+        } else {
+            execl(shell_path.c_str(), shell_name, nullptr);
+        }
+        perror(("execv " + shell_path).c_str());
         _exit(127);
     }
 
@@ -1020,19 +1125,45 @@ void ensure_tty_running(TtySupervisor& tty, bool is_live) {
         return;
     }
 
-    tty.pid = spawn_getty(tty.tty, is_live ? "root" : nullptr);
+    if (tty.emergency_shell) {
+        tty.pid = spawn_emergency_shell(tty.tty);
+    } else {
+        tty.pid = spawn_getty(tty.tty, is_live ? "root" : nullptr);
+    }
     if (tty.pid <= 0) {
-        std::cerr << "[GINIT] Failed to spawn getty for " << tty.tty << std::endl;
+        std::cerr << "[GINIT] Failed to spawn " << (tty.emergency_shell ? "emergency shell" : "getty")
+                  << " for " << tty.tty << std::endl;
+        if (!is_live && !tty.emergency_shell && std::string(tty.tty) == "/dev/ttyS0") {
+            tty.emergency_shell = true;
+            tty.pid = spawn_emergency_shell(tty.tty);
+            if (tty.pid > 0) {
+                std::cerr << "[GINIT] Switched " << tty.tty << " to emergency shell after getty startup failure." << std::endl;
+            } else {
+                std::cerr << "[GINIT] Failed to spawn emergency shell for " << tty.tty << std::endl;
+            }
+        }
     }
 }
 
-bool handle_tty_exit(pid_t pid, std::array<TtySupervisor, 4>& terminals, bool is_live) {
+bool handle_tty_exit(pid_t pid, int status, std::array<TtySupervisor, 4>& terminals, bool is_live) {
     for (auto& tty : terminals) {
         if (tty.pid != pid) {
             continue;
         }
 
         tty.pid = -1;
+        if (std::string(tty.tty) == "/dev/ttyS0" && !is_live) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                tty.failure_count = 0;
+            } else {
+                ++tty.failure_count;
+                if (tty.failure_count >= 1) {
+                    tty.emergency_shell = true;
+                    std::cerr << "[GINIT] Serial getty exited with " << wait_status_to_string_local(status)
+                              << "; starting emergency shell on " << tty.tty << std::endl;
+                }
+            }
+        }
         ensure_tty_running(tty, is_live);
         return true;
     }
@@ -1046,7 +1177,7 @@ void reap_children(std::array<TtySupervisor, 4>& terminals, bool is_live) {
         if (pid > 0) {
             if (service_manager.is_managed_process(pid)) {
                 service_manager.handle_process_death(pid, status);
-            } else if (!handle_tty_exit(pid, terminals, is_live)) {
+            } else if (!handle_tty_exit(pid, status, terminals, is_live)) {
                 if (boot_verbose_enabled()) {
                     std::cerr << "[GINIT] Reaped untracked child PID " << pid << std::endl;
                 }

@@ -22,14 +22,13 @@ BINDIR = bin
 LIBDIR = lib
 
 # Targets 
-TARGETS = $(BINDIR)/ginit $(BINDIR)/ginit-netcfg $(BINDIR)/getty $(BINDIR)/login
+TARGETS = $(BINDIR)/ginit $(BINDIR)/ginit-netcfg $(BINDIR)/login
 LIBRARY = $(LIBDIR)/libgemcore.a
 
 # Objects
 LIB_OBJS = $(OBJDIR)/signals.o $(OBJDIR)/network.o $(OBJDIR)/user_mgmt.o $(OBJDIR)/user_mgmt_bootstrap.o
 GINIT_OBJS = $(OBJDIR)/ginit.o $(OBJDIR)/gservice_parser.o $(OBJDIR)/gservice_manager.o
 NETCFG_OBJS = $(OBJDIR)/ginit_netcfg.o
-GETTY_OBJS = $(OBJDIR)/getty.o
 LOGIN_OBJS = $(OBJDIR)/login.o
 
 all: $(BINDIR) $(OBJDIR) $(LIBDIR) $(LIBRARY) $(TARGETS)
@@ -46,9 +45,6 @@ $(BINDIR)/ginit: $(GINIT_OBJS) $(LIBRARY)
 $(BINDIR)/ginit-netcfg: $(NETCFG_OBJS) $(LIBRARY)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(NETCFG_OBJS) $(LIBRARY) $(LDFLAGS) $(NETCFG_LDLIBS) $(TARGET_RUNTIME_LD)
 
-$(BINDIR)/getty: $(GETTY_OBJS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(TARGET_RUNTIME_LD)
-
 $(BINDIR)/login: $(LOGIN_OBJS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(LOGIN_OBJS) $(LDFLAGS) $(LOGIN_LDLIBS) $(TARGET_RUNTIME_LD)
 
@@ -64,7 +60,6 @@ install: all
 	cp $(BINDIR)/ginit $(DESTDIR)/bin/ginit
 	cp $(BINDIR)/ginit-netcfg $(DESTDIR)/bin/ginit-netcfg
 	cp $(BINDIR)/login $(DESTDIR)/usr/bin/login
-	cp $(BINDIR)/getty $(DESTDIR)/usr/sbin/getty
 	cp boot-services.conf $(DESTDIR)/usr/lib/ginit/boot-services.conf
 	cp services/*.gservice $(DESTDIR)/usr/lib/ginit/services/
 	# Note: symlinks and other setup are handled by the main build script for now
